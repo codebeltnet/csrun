@@ -8,10 +8,16 @@
 - Validate changes with the relevant executable tests and report any validation limits honestly.
 - Do not push, create a PR, or publish a release without explicit approval.
 
+## GitHub Actions policy
+
+- Prefer Codebelt actions and reusable workflows whenever they support the required behavior.
+- Reference actions and reusable workflows with floating version tags, not commit SHAs.
+- Use external actions only where the Codebelt ecosystem has no suitable equivalent.
+
 ## .NET support policy
 
 - Use only .NET 10 and later SDKs, runtimes, and application/test target frameworks. Do not introduce .NET 8, .NET 9, or older execution targets.
 - Allowed release channels are supported LTS and STS releases, plus preview and go-live releases on .NET 10 or later. Exclude end-of-life channels.
 - Verify support status and version choices against Microsoft's authoritative [release index](https://raw.githubusercontent.com/dotnet/core/main/release-notes/releases-index.json), following its per-channel metadata when needed. Do not infer support status from the major version alone.
-- Keep selected SDKs and direct NuGet dependencies pinned. Do not silently upgrade packages, retarget examples, or install SDKs at runner execution time.
+- CI uses `codebeltnet/install-dotnet@v3` with patch precision to follow the current supported GA SDKs. Test runs select and verify an exact installed SDK for their required channel. Keep direct NuGet dependencies pinned. Do not silently upgrade packages, retarget examples, or install SDKs at runner execution time.
 - An omitted framework selects the highest supported GA LTS channel; explicit frameworks are validated against the release index and never silently substituted. The latest preview or go-live channel is allowed only when explicitly requested.
