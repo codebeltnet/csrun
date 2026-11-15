@@ -4,6 +4,16 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.0] - 2026-11-15
+
+This minor release adds optional disposable Ubuntu container execution while preserving the standalone native PowerShell engine and manifest schema version 1.
+
+### Added
+
+- Added `csrun.Dockerfile` and a UTF-8 stdin adapter for console samples and genuine xUnit v3 tests, with non-root execution and read-only root filesystem support,
+- Added a self-contained `BuildAndPublish` module with explicit single/combined SDK environments, existing SDK tag conventions, verified latest-release engine assets, image identity metadata, and Buildx SBOM/provenance publication options,
+- Added Docker integration tests and Ubuntu AMD64/ARM64 CI validation alongside the existing native Windows tests, plus container usage, isolation, image caching and deliberate publication documentation.
+
 ## [0.1.0] - 2026-11-15
 
 This is the first release that introduces csrun as a standalone PowerShell script for running complete C# console programs and xUnit v3 tests from a manifest, a source file, or inline source, with framework defaults resolved from Microsoft's official .NET release index.
@@ -21,4 +31,5 @@ This is the first release that introduces csrun as a standalone PowerShell scrip
 - Added pull request and tag release workflows that run the test suite on Windows with the .NET 11 SDK and a .NET 10 compatibility job, then create a draft GitHub release with the tested `csrun.ps1` attached,
 - Added the MIT license.
 
+[0.2.0]: https://github.com/codebeltnet/csrun/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/codebeltnet/csrun/releases/tag/v0.1.0
