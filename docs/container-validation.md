@@ -1,6 +1,6 @@
 # Container validation
 
-Local validation on 2026-11-15 uses Windows PowerShell 7, Docker Desktop 4.97.0 with Linux AMD64 containers, Docker Engine 29.9.2 and Buildx 0.38.1. No images were published. The native executor is unchanged from the released source.
+The initial validation below predates the OCI delivery changes. Local validation on 2026-11-15 uses Windows PowerShell 7, Docker Desktop 4.97.0 with Linux AMD64 containers, Docker Engine 29.9.2 and Buildx 0.38.1. No images were published. The native executor is unchanged from the released source.
 
 ## Engine and base identities
 
@@ -37,9 +37,30 @@ The combined image adds about 859 MiB over the .NET 11 image to retain the .NET 
 
 Both exact console and xUnit stdin one-liners were executed from Windows PowerShell against the locally built `codebeltnet/csrun:10` image and returned `0`, with `42` and one passing test respectively. Further exit-code checks include console exit `23`, compilation exit `1`, MTP failed assertion exit `2` and no-test exit `8`.
 
+## OCI delivery verification
+
+The refreshed build path exports BuildKit OCI content once with SBOM and maximum provenance, converts that content for native testing, and compares raw Docker-exported config bytes with the original OCI config. This matters on Docker Desktop's containerd image store: its image ID can be a manifest digest rather than a config digest. A changed serialization is not treated as changed filesystem/config content.
+
+- The unchanged standalone engine again passed all 106 Windows checks: 91 with SDK 11.0.100 and 15 with SDK 10.0.115.
+- Eleven publishing-module contracts pass, including fork registry/context plans and rejection of a foreign Docker CPU before downloads.
+- Twenty offline artifact/lifecycle tests pass. They cover exact platform inventory, config/source/SDK/engine identity, missing or unrelated SBOM/provenance, provenance build arguments, corrupt archives/blobs, preservation of manifests during assembly, split/recovery byte identity, draft/stale releases, fork source identities, and rejection of Docker `latest` before any upload.
+- The generic Codebelt `oci-artifact-verify@v1` verifier accepted an assembled two-platform contract fixture. This validates the archive contract, not ARM64 execution.
+- Real AMD64 OCI exports include nonempty SPDX SBOMs and SLSA provenance bound to their platform manifests and source/engine/SDK build inputs. An unnamed BuildKit export initially emitted empty attestation subjects; the verifier rejected it. Naming the export fixed the subjects.
+- All three refreshed OCI exports passed native AMD64 execution and exact exported-config verification: 22 checks for .NET 10, 22 for .NET 11, and 23 for the combined image (67 total). The combined image compiles and executes console and xUnit samples on both TFMs.
+
+Refreshed export measurements are below. Docker reports local image storage differently after Docker-format import; these values are not directly comparable with the initial build's logical size measurements. OCI archive bytes include compressed layers, manifests and attestations, and are a better guide to artifact transfer/storage. Neither measure promises incremental disk usage with shared layers.
+
+| Environment | Docker-reported local image bytes | OCI archive bytes |
+| --- | ---: | ---: |
+| `10` | 1,978,122,006 | 390,060,032 |
+| `11` | 1,427,258,798 | 360,735,744 |
+| `10-11` | 2,734,862,369 | 608,526,336 |
+
+Candidate verification uses checked-out bytes, annotated `v0.2.0`; this is not evidence that a v0.2.0 GitHub Release has been published. Their script checksum remains `6609acb7ac9df5cbbbf70d58b3dbc40f2d242e34831f89c7b42d7069015db802`.
+
 ## Limits and release work
 
-- ARM64 local execution is unavailable: the official ARM64 base image fails with `exec format error`, including a direct `uname` invocation. No privileged emulator installation was attempted. The workflow configures native Ubuntu ARM64 runners, but their execution is unverified until an approved push. Multi-architecture support is not yet established.
-- PR/tag workflows, registry publication, generated SBOM/provenance attestations and final registry digests have not been exercised remotely. No Docker Hub credentials were used. Buildx publication explicitly requests SBOM/provenance and writes digest metadata; validate those outputs during the approved publication operation.
-- The v0.2.0 changelog entry is a draft until the approved release is published. Publish the reviewed GitHub release before rebuilding images if they should contain its new engine; pre-publication container CI intentionally uses the current latest published asset.
-- See the README for the exact test commands, hardened one-liner, module options and release sequence. Preserve `artifacts/*.json` from approved builds and attach published registry digests to release notes.
+- The earlier local ARM64 `exec format error` is a host execution limitation, not a confirmed image defect. No privileged emulation was installed. Real ARM64 execution is required on `ubuntu-26.04-arm`; AMD64 uses `ubuntu-26.04`. Neither GitHub-hosted runner has been exercised in this session, and native ARM64 support is not established by local exports or fixture tests.
+- No Docker Hub credentials were used and no registry publication or registry attestation preservation has been verified. BuildKit predicate validation does not introduce a separate signing authority. Authorized CI execution and a real push plus immutable registry inspection remain required before release completion.
+- Release preparation packages the candidate engine and native-tested platform content into durable, checksummed draft GitHub Release assets. After publication, CD resolves the canonical latest script once, requires its release identity and exact checksum to match, and promotes existing content. Deployment recovery never rebuilds or substitutes missing artifacts.
+- Configure required branch checks and reviewers for the `Production` environment before enabling publication. Only its publishing step receives Docker Hub credentials. See the README for the independent manual builder, native remote contexts, release asset storage and controlled recovery procedures.
