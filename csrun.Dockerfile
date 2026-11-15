@@ -12,11 +12,12 @@ RUN pwsh -NoLogo -NoProfile -NonInteractive -File /opt/csrun-build.ps1 \
 COPY csrun.ps1 container-entrypoint.ps1 /opt/csrun/
 ARG ENGINE_VERSION
 ARG ENGINE_SHA256
+ARG ENGINE_URL=https://github.com/codebeltnet/csrun/releases/latest/download/csrun.ps1
 RUN test -n "$ENGINE_VERSION" && test -n "$ENGINE_SHA256" \
     && echo "$ENGINE_SHA256  /opt/csrun/csrun.ps1" | sha256sum --check --strict
 LABEL net.codebelt.csrun.engine.release=${ENGINE_VERSION} \
       net.codebelt.csrun.engine.sha256=${ENGINE_SHA256} \
-      net.codebelt.csrun.engine.url="https://github.com/codebeltnet/csrun/releases/latest/download/csrun.ps1"
+      net.codebelt.csrun.engine.url=${ENGINE_URL}
 ENV HOME=/tmp \
     DOTNET_CLI_HOME=/tmp \
     NUGET_PACKAGES=/tmp/.nuget/packages \

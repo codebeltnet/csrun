@@ -9,7 +9,7 @@ function Resolve-DotNetSdkTagSet {
     $match = [regex]::Match($trimmedVersion, '^(?<Major>\d+)\.(?<Minor>\d+)\.(?<Feature>\d+)(?<Suffix>-.+)?$')
 
     if (-not $match.Success) {
-        throw "Unsupported .NET SDK version '$SdkVersion'. Expected forms like '8.0.425' or '11.0.100-rc.1.26425.128'."
+        throw "Unsupported .NET SDK version '$SdkVersion'. Expected forms like '10.0.404' or '11.0.100-rc.1.26425.128'."
     }
 
     $major = $match.Groups['Major'].Value
@@ -95,9 +95,23 @@ function BuildAndPublish {
 
         [string]$Dockerfile = './csrun.Dockerfile',
 
-        [ValidateSet('linux/amd64', 'linux/arm64')][string[]]$Platform = @('linux/amd64'),
+        [ValidateSet('linux/amd64', 'linux/arm64')][string[]]$Platform,
+
+        [hashtable]$DockerContext = @{},
+
+        [hashtable]$Builder = @{},
 
         [switch]$BuildOnly,
+
+        [string]$EnginePath,
+
+        [string]$EngineVersion,
+
+        [string]$EngineRepository = 'codebeltnet/csrun',
+
+        [string]$SourceRepository = 'https://github.com/codebeltnet/csrun',
+
+        [string]$ArchivePath = './artifacts/csrun.oci.tar',
 
         [string]$MetadataFile = './artifacts/csrun-image.json',
 
@@ -107,6 +121,9 @@ function BuildAndPublish {
     Set-StrictMode -Version Latest
     $ErrorActionPreference = 'Stop'
     $PSNativeCommandUseErrorActionPreference = $false
+    if (-not $Platform) {
+        $Platform = if ($BuildOnly) { @('linux/' + [Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString().ToLowerInvariant().Replace('x64', 'amd64')) } else { @('linux/amd64', 'linux/arm64') }
+    }
     $resolvedVersions = @(foreach ($version in $SdkVersion) {
         Resolve-DotNetSdkTagSet -SdkVersion $version
     })
@@ -123,18 +140,27 @@ function BuildAndPublish {
     if (@($tags | Where-Object { $_.Length -gt 128 -or $_ -cnotmatch '^[A-Za-z0-9_][A-Za-z0-9_.-]*$' }).Count) { throw 'Invalid or overlong Docker tag.' }
     if ($BuildOnly -and $Platform.Count -ne 1) { throw 'BuildOnly loads one architecture at a time; test each explicitly.' }
     $image = '{0}/{1}' -f $Repository.TrimEnd('/'), $ImageName
+    if (@($Platform | Select-Object -Unique).Count -ne $Platform.Count) { throw 'Supply each target platform only once.' }
+    if ($EnginePath -and $EngineVersion -cnotmatch '^v\d+\.\d+\.\d+$') { throw 'Local engines require an explicit release version.' }
+    if (-not $BuildOnly -and $image -ceq 'docker.io/codebeltnet/csrun') {
+        if ($Platform.Count -ne 2) { throw 'Codebelt production requires both native AMD64 and ARM64 verification.' }
+        if ($EnginePath -or $EngineRepository -cne 'codebeltnet/csrun' -or $SourceRepository -cne 'https://github.com/codebeltnet/csrun') { throw 'Codebelt production images require the canonical source and verified latest published engine.' }
+    }
 
     $invocation = [pscustomobject]@{
         ImageName      = $ImageName
         Repository     = $Repository
         Dockerfile     = $Dockerfile
-        SdkVersions    = $resolvedVersions.FullVersion
+        SourceRepository = $SourceRepository
+        SdkVersions    = @($resolvedVersions.FullVersion)
         MajorTags      = $majorTags
         MajorMinorTags = $majorMinorTags
         PublishTags    = $publishTags
         BuildArgs      = @()
         Tags           = @($tags | ForEach-Object { "${image}:$_" })
         Platforms      = $Platform
+        DockerContexts = $DockerContext
+        Builders       = $Builder
         EngineVersion  = $null
         EngineSha256   = $null
         BaseImage      = $null
@@ -142,22 +168,31 @@ function BuildAndPublish {
         Published      = $false
         ImageId        = $null
         SizeBytes      = $null
+        ConfigDigest   = $null
+        OciArchiveBytes = $null
     }
 
     $targetImage = $invocation.Tags[0]
 
-    $action = if ($BuildOnly) { 'Build and test local Docker image' } else { 'Build, test and publish Docker image' }
+    $action = if ($BuildOnly) { 'Build and test local Docker image' } else { 'Build, natively test and publish Docker image' }
     if ($PSCmdlet.ShouldProcess($targetImage, $action)) {
         $dockerfilePath = (Resolve-Path -LiteralPath $Dockerfile).Path
         if (-not $BuildOnly) {
             $status = & git -C $PSScriptRoot status --porcelain
             if ($LASTEXITCODE -ne 0 -or $status) { throw 'Publication requires a clean, reviewed source commit. Use BuildOnly for worktree validation.' }
         }
+        foreach ($architecture in $Platform) {
+            $contextArgs = if ($DockerContext.ContainsKey($architecture)) { @('--context', [string]$DockerContext[$architecture]) } else { @() }
+            $daemon = & docker @contextArgs info --format '{{.OSType}}/{{.Architecture}}'
+            if ($LASTEXITCODE -ne 0) { throw "Cannot access native Docker host for $architecture. Configure -DockerContext and -Builder." }
+            $normalized = $daemon.Trim().Replace('x86_64', 'amd64').Replace('aarch64', 'arm64')
+            if ($normalized -cne $architecture) { throw "Native Docker host required for $architecture; got $normalized. Configure an explicit remote -DockerContext; emulation is insufficient." }
+        }
         $index = (Invoke-RestMethod 'https://raw.githubusercontent.com/dotnet/core/main/release-notes/releases-index.json').'releases-index'
         $sdks = @($resolvedVersions | ForEach-Object { Get-CsrunSdkRelease $_.FullVersion $index })
         $base = $resolvedVersions | Sort-Object { [version](($_.FullVersion -split '-')[0]) } -Descending | Select-Object -First 1
         $available = (Invoke-RestMethod 'https://mcr.microsoft.com/v2/dotnet/sdk/tags/list').tags
-        $baseTag = @('noble', 'resolute') | ForEach-Object { "$($base.PublishTag)-$_" } | Where-Object { $_ -cin $available } | Select-Object -First 1
+        $baseTag = @('resolute', 'noble') | ForEach-Object { "$($base.PublishTag)-$_" } | Where-Object { $_ -cin $available } | Select-Object -First 1
         if (-not $baseTag) { throw "No verified Ubuntu SDK image for $($base.FullVersion)." }
         $baseImage = "mcr.microsoft.com/dotnet/sdk:$baseTag"
         $inspection = & docker buildx imagetools inspect $baseImage
@@ -170,15 +205,23 @@ function BuildAndPublish {
         try {
             Copy-Item -LiteralPath $dockerfilePath -Destination (Join-Path $context 'csrun.Dockerfile')
             $dockerfilePath = Join-Path $context 'csrun.Dockerfile'
-            # Resolve once, then verify the canonical latest asset against that
-            # release's digest. A concurrent release change fails closed.
-            $release = Invoke-RestMethod 'https://api.github.com/repos/codebeltnet/csrun/releases/latest'
-            $asset = @($release.assets | Where-Object name -CEQ 'csrun.ps1')
-            if ($release.tag_name -cnotmatch '^v\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$' -or $asset.Count -ne 1 -or $asset[0].digest -cnotmatch '^sha256:[a-f0-9]{64}$') { throw 'Latest release has no verifiable csrun.ps1 asset.' }
             $engine = Join-Path $context 'csrun.ps1'
-            Invoke-WebRequest 'https://github.com/codebeltnet/csrun/releases/latest/download/csrun.ps1' -OutFile $engine
-            $hash = (Get-FileHash $engine -Algorithm SHA256).Hash.ToLowerInvariant()
-            if ("sha256:$hash" -cne $asset[0].digest -or (Get-Item $engine).Length -ne $asset[0].size) { throw 'Latest engine asset changed or failed integrity validation; retry the operation.' }
+            $engineUrl = "https://github.com/$EngineRepository/releases/latest/download/csrun.ps1"
+            if ($EnginePath) {
+                Copy-Item -LiteralPath $EnginePath -Destination $engine
+                if ($SourceRepository -cne 'https://github.com/codebeltnet/csrun') { $engineUrl = 'file:csrun.ps1' }
+                $release = @{tag_name=$EngineVersion}
+                $hash = (Get-FileHash $engine -Algorithm SHA256).Hash.ToLowerInvariant()
+            } else {
+                # Resolve the moving reference once for all requested platforms.
+                if ($EngineRepository -cnotmatch '^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$') { throw 'Invalid engine repository.' }
+                $release = Invoke-RestMethod "https://api.github.com/repos/$EngineRepository/releases/latest"
+                $asset = @($release.assets | Where-Object name -CEQ 'csrun.ps1')
+                if ($release.draft -or $release.tag_name -cnotmatch '^v\d+\.\d+\.\d+$' -or $asset.Count -ne 1 -or $asset[0].digest -cnotmatch '^sha256:[a-f0-9]{64}$') { throw 'Latest release has no verifiable csrun.ps1 asset.' }
+                Invoke-WebRequest $engineUrl -OutFile $engine
+                $hash = (Get-FileHash $engine -Algorithm SHA256).Hash.ToLowerInvariant()
+                if ("sha256:$hash" -cne $asset[0].digest -or (Get-Item $engine).Length -ne $asset[0].size) { throw 'Latest engine asset changed or failed integrity validation.' }
+            }
             $tokens = $null; $errors = $null
             $ast = [System.Management.Automation.Language.Parser]::ParseFile($engine, [ref]$tokens, [ref]$errors)
             if ($errors.Count -or -not $ast.ParamBlock -or 'ManifestJson' -notin $ast.ParamBlock.Parameters.Name.VariablePath.UserPath) { throw 'Downloaded engine is not a valid manifest-capable PowerShell script.' }
@@ -188,27 +231,66 @@ function BuildAndPublish {
             $revision = & git -C $PSScriptRoot rev-parse HEAD
             if ($LASTEXITCODE -ne 0) { throw 'Unable to identify packaging source commit.' }
             $extra = @($sdks | Where-Object version -CNE $base.FullVersion | ForEach-Object { @{version=$_.version; files=@($_.files | Where-Object { $_.rid -in @('linux-x64', 'linux-arm64') -and $_.url.EndsWith('.tar.gz') })} })
-            $buildArgs = @('--build-arg', "BASE_IMAGE=$($invocation.BaseImage)", '--build-arg', "SDK_ARTIFACTS_JSON=$(ConvertTo-Json -InputObject $extra -Depth 8 -Compress)", '--build-arg', "ENGINE_VERSION=$($invocation.EngineVersion)", '--build-arg', "ENGINE_SHA256=$hash", '--label', "org.opencontainers.image.version=$($invocation.EngineVersion)", '--label', 'org.opencontainers.image.source=https://github.com/codebeltnet/csrun', '--label', "org.opencontainers.image.revision=$revision")
+            $buildArgs = @('--build-arg', "BASE_IMAGE=$($invocation.BaseImage)", '--build-arg', "SDK_ARTIFACTS_JSON=$(ConvertTo-Json -InputObject $extra -Depth 8 -Compress)", '--build-arg', "ENGINE_VERSION=$($invocation.EngineVersion)", '--build-arg', "ENGINE_SHA256=$hash", '--build-arg', "ENGINE_URL=$engineUrl", '--label', "org.opencontainers.image.version=$($invocation.EngineVersion)", '--label', "org.opencontainers.image.source=$SourceRepository", '--label', "org.opencontainers.image.revision=$revision")
             $invocation.BuildArgs = @($buildArgs[1], $buildArgs[3], $buildArgs[5], $buildArgs[7])
             $null = New-Item -ItemType Directory -Force -Path (Split-Path $invocation.MetadataFile)
+            $archiveRoot = [IO.Path]::GetFullPath($ArchivePath)
+            $archives = @()
+            $verification = @()
             foreach ($architecture in $Platform) {
-                $iid = Join-Path $context 'image-id'
-                Invoke-CsrunDocker (@('buildx', 'build', '--load', '--provenance=false', '--platform', $architecture, '--iidfile', $iid, '--file', $dockerfilePath) + $buildArgs + @($context))
-                $imageId = (Get-Content $iid -Raw).Trim()
-                & (Join-Path $PSScriptRoot 'tests/container.Tests.ps1') -Image $imageId -SdkVersion $resolvedVersions.FullVersion -Platform $architecture -EngineSha256 $hash
+                $cpu = ($architecture -split '/')[1]
+                $contextArgs = if ($DockerContext.ContainsKey($architecture)) { @('--context', [string]$DockerContext[$architecture]) } else { @() }
+                $builderArgs = if ($Builder.ContainsKey($architecture)) { @('--builder', [string]$Builder[$architecture]) } else { @() }
+                $archive = "$archiveRoot.$cpu.tar"
+                $null = New-Item -ItemType Directory -Force -Path (Split-Path $archive)
+                $created = [DateTime]::UtcNow.ToString('o')
+                Invoke-CsrunDocker ($contextArgs + @('buildx', 'build') + $builderArgs + @('--output', "type=oci,name=$targetImage,dest=$archive", '--sbom=true', '--provenance=mode=max', '--platform', $architecture, '--file', $dockerfilePath, '--label', "org.opencontainers.image.created=$created", '--label', "net.codebelt.csrun.sdks=$($resolvedVersions.FullVersion -join ',')") + $buildArgs + @($context))
+                & python (Join-Path $PSScriptRoot 'tools/oci.py') verify $archive --version $release.tag_name --revision $revision --engine $hash --source $SourceRepository --platform $cpu
+                if ($LASTEXITCODE -ne 0) { throw 'OCI verification failed.' }
+                $localImage = 'csrun-verify:' + $cpu + '-' + [guid]::NewGuid().ToString('N')
+                $loadArchive = Join-Path $context "image-$cpu.docker.tar"
+                if (Get-Command skopeo -ErrorAction SilentlyContinue) {
+                    & skopeo copy --override-os linux --override-arch $cpu "oci-archive:$archive" "docker-archive:${loadArchive}:$localImage"
+                    if ($LASTEXITCODE -ne 0) { throw 'Cannot load the exported OCI artifact for native testing.' }
+                } else {
+                    Invoke-CsrunDocker @('run', '--rm', '--user', '0', '--volume', "$(Split-Path $archive):/oci:ro", '--volume', "${context}:/converted", 'quay.io/skopeo/stable:v1.20.0', 'copy', '--override-os', 'linux', '--override-arch', $cpu, "oci-archive:/oci/$(Split-Path $archive -Leaf)", "docker-archive:/converted/$(Split-Path $loadArchive -Leaf):$localImage")
+                }
+                Invoke-CsrunDocker ($contextArgs + @('load', '--input', $loadArchive))
+                Remove-Item -LiteralPath $loadArchive -Force
+                & (Join-Path $PSScriptRoot 'tests/container.Tests.ps1') -Image $localImage -SdkVersion $resolvedVersions.FullVersion -Platform $architecture -EngineSha256 $hash -EngineUrl $engineUrl -RequireNative -DockerContext $(if ($DockerContext.ContainsKey($architecture)) { [string]$DockerContext[$architecture] } else { '' })
                 if ($LASTEXITCODE -ne 0) { throw "Container tests failed on $architecture." }
-            }
-            if ($BuildOnly) {
-                foreach ($tag in $invocation.Tags) { Invoke-CsrunDocker @('tag', $imageId, $tag) }
-                $details = & docker image inspect $imageId | ConvertFrom-Json
+                $details = @(& docker @contextArgs image inspect $localImage | ConvertFrom-Json)[0]
                 if ($LASTEXITCODE -ne 0) { throw 'Unable to inspect tested image.' }
-                $invocation.ImageId = $imageId
-                $invocation.SizeBytes = @($details)[0].Size
-                $invocation | ConvertTo-Json -Depth 8 | Set-Content $invocation.MetadataFile
+                $verifyContextArgs = if ($DockerContext.ContainsKey($architecture)) { @('--context', [string]$DockerContext[$architecture]) } else { @() }
+                $configDigest = & python (Join-Path $PSScriptRoot 'tools/oci.py') loaded-config $archive --platform $cpu --image $localImage @verifyContextArgs
+                if ($LASTEXITCODE -ne 0) { throw 'Loaded image differs from exported OCI artifact.' }
+                $invocation.ConfigDigest = $configDigest
+                $invocation.ImageId = $details.Id
+                $invocation.SizeBytes = $details.Size
+                $invocation.OciArchiveBytes = (Get-Item -LiteralPath $archive).Length
+                $archives += $archive
+                $verification += [pscustomobject]@{Platform=$architecture; ImageId=$details.Id; ConfigDigest=$configDigest; SizeBytes=$details.Size; NativeVerified=$true}
+            }
+            $invocation | Add-Member Verification $verification
+            $invocation | Add-Member ArchivePaths $archives
+            $invocation | Add-Member SourceCommit $revision
+            $invocation | Add-Member NativeVerified $true
+            $invocation | ConvertTo-Json -Depth 8 | Set-Content $invocation.MetadataFile
+            if ($BuildOnly) {
+                foreach ($tag in $invocation.Tags) { Invoke-CsrunDocker ($contextArgs + @('tag', $localImage, $tag)) }
             } else {
-                $tagArgs = @($invocation.Tags | ForEach-Object { '--tag'; $_ })
-                Invoke-CsrunDocker (@('buildx', 'build', '--push', '--sbom=true', '--provenance=mode=max', '--platform', ($Platform -join ','), '--metadata-file', $invocation.MetadataFile, '--file', $dockerfilePath) + $tagArgs + $buildArgs + @($context))
+                if (-not $EnginePath) {
+                    $currentRelease = Invoke-RestMethod "https://api.github.com/repos/$EngineRepository/releases/latest"
+                    if ($currentRelease.id -ne $release.id) { throw 'Latest engine release changed during native verification; refusing stale alias publication.' }
+                }
+                $platformArgs = if ($Platform.Count -eq 1) { @('--platform', ($Platform[0] -split '/')[1]) } else { @() }
+                & python (Join-Path $PSScriptRoot 'tools/oci.py') merge $archiveRoot --version $release.tag_name --revision $revision --engine $hash --source $SourceRepository @platformArgs @archives
+                if ($LASTEXITCODE -ne 0) { throw 'Cannot assemble native-verified artifacts.' }
+                & python (Join-Path $PSScriptRoot 'tools/oci.py') publish $archiveRoot --version $release.tag_name --revision $revision --engine $hash --source $SourceRepository @platformArgs --tags @($invocation.Tags)
+                if ($LASTEXITCODE -ne 0) { throw 'Registry promotion or inspection failed.' }
                 $invocation.Published = $true
+                $invocation | Add-Member RegistryImages (Get-Content "$archiveRoot.published.json" -Raw | ConvertFrom-Json)
+                $invocation | ConvertTo-Json -Depth 10 | Set-Content $invocation.MetadataFile
             }
         } finally {
             # Only remove the exact temporary context created by this invocation.

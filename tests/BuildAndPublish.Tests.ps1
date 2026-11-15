@@ -41,6 +41,22 @@ Test-Case 'custom image, registry and Dockerfile options' {
 Test-Case 'publication aliases are absent' {
     if ((Get-Command BuildAndPublish).Parameters.ContainsKey('Latest')) { throw 'Unexpected Latest parameter.' }
 }
+Test-Case 'manual builds support independent registry and native Docker contexts' {
+    $contexts = @{ 'linux/amd64'='my-amd64'; 'linux/arm64'='my-arm64' }
+    $builders = @{ 'linux/amd64'='builder-amd64'; 'linux/arm64'='builder-arm64' }
+    $plan = BuildAndPublish 10.0.404 11.0.100 -Registry registry.example/team -DockerContext $contexts -Builder $builders -WhatIf -PassThru
+    if ($plan.Tags[0] -cne 'registry.example/team/csrun:10.0.404-11.0.100' -or $plan.Platforms.Count -ne 2 -or $plan.DockerContexts['linux/arm64'] -cne 'my-arm64' -or $plan.Builders['linux/amd64'] -cne 'builder-amd64') { throw 'Independent manual build plan changed.' }
+}
+Test-Case 'a foreign CPU fails before downloads rather than using emulation' {
+    & $module {
+        function docker { $global:LASTEXITCODE = 0; 'linux/x86_64' }
+        try {
+            $rejected = $false
+            try { BuildAndPublish 10.0.404 -BuildOnly -Platform linux/arm64 } catch { $rejected = $_ -match 'Native Docker host required for linux/arm64' }
+            if (-not $rejected) { throw 'Foreign Docker CPU was accepted.' }
+        } finally { Remove-Item Function:docker }
+    }
+}
 Test-Case 'unsupported/EOL metadata channels fail before exact SDK lookup' {
     $fixture = (Get-Content "$PSScriptRoot/fixtures/releases-index.json" -Raw | ConvertFrom-Json -AsHashtable)['releases-index']
     & $module {

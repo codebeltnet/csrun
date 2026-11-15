@@ -4,6 +4,9 @@ param(
     [Parameter(Mandatory)][string] $Image,
     [Parameter(Mandatory)][string[]] $SdkVersion,
     [ValidateSet('linux/amd64', 'linux/arm64')][string] $Platform = 'linux/amd64',
+    [switch] $RequireNative,
+    [string] $DockerContext,
+    [string] $EngineUrl = 'https://github.com/codebeltnet/csrun/releases/latest/download/csrun.ps1',
     [string] $EngineSha256
 )
 Set-StrictMode -Version Latest
@@ -17,6 +20,7 @@ function Invoke-Docker([string[]] $Arguments, [string] $InputText = '') {
         $containerName = 'csrun-test-' + [guid]::NewGuid().ToString('N')
         $Arguments = @('run', '--name', $containerName) + $Arguments[1..($Arguments.Count - 1)]
     }
+    if ($DockerContext) { $Arguments = @('--context', $DockerContext) + $Arguments }
     $start = [Diagnostics.ProcessStartInfo]::new($docker)
     $start.UseShellExecute = $false
     $start.RedirectStandardInput = $true
@@ -37,7 +41,10 @@ function Invoke-Docker([string[]] $Arguments, [string] $InputText = '') {
         return @{ Code=$process.ExitCode; Out=$out; Err=$err; Text=($out + "`n" + $err -replace '\x1B\[[0-?]*[ -/]*[@-~]', '') }
     } finally {
         if ($containerName -and -not $process.HasExited) { $process.Kill($true); $process.WaitForExit() }
-        if ($containerName -and $process.ExitCode -ne 0) { & $docker rm --force $containerName 2>$null | Out-Null }
+        if ($containerName -and $process.ExitCode -ne 0) {
+            $contextArgs = if ($DockerContext) { @('--context', $DockerContext) } else { @() }
+            & $docker @contextArgs rm --force $containerName 2>$null | Out-Null
+        }
         $process.Dispose()
     }
 }
@@ -57,6 +64,21 @@ function New-Manifest([string] $Source, [string] $Mode = 'console', [string] $Fr
 }
 $channels = @($SdkVersion | ForEach-Object { ($_ -split '\.')[0..1] -join '.' })
 $framework = 'net' + ($channels | Sort-Object { [version]$_ } | Select-Object -First 1)
+Test-Case 'native CPU, image architecture, PowerShell and .NET runtime architecture' {
+    $expectedCpu = ($Platform -split '/')[1]
+    if ($RequireNative) {
+        $hostCpu = [Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString().ToLowerInvariant().Replace('x64', 'amd64')
+        if (-not $DockerContext -and $hostCpu -cne $expectedCpu) { throw "Native runner required: $hostCpu != $expectedCpu" }
+        $daemon = Invoke-Docker @('info', '--format', '{{.Architecture}}')
+        Assert-Result $daemon 0 $(if ($expectedCpu -eq 'amd64') { '^(x86_64|amd64)\s*$' } else { '^(aarch64|arm64)\s*$' })
+    }
+    $config = Invoke-Docker @('image', 'inspect', $Image)
+    Assert-Result $config
+    if (@($config.Out | ConvertFrom-Json)[0].Architecture -cne $expectedCpu) { throw 'Image CPU mismatch.' }
+    $runtimeCpu = if ($expectedCpu -eq 'amd64') { 'X64' } else { 'Arm64' }
+    Assert-Result (Invoke-Docker @('run', '--rm', '--platform', $Platform, '--entrypoint', 'pwsh', $Image, '-NoProfile', '-Command', '$PSVersionTable.PSVersion.ToString()')) 0 '^7\.'
+    Assert-Result (Invoke-Manifest (New-Manifest 'Console.WriteLine(System.Runtime.InteropServices.RuntimeInformation.ProcessArchitecture);')) 0 "(?m)^$runtimeCpu\r?$"
+}
 Test-Case 'exact installed SDK and associated runtime inventories' {
     $sdks = Invoke-Docker @('run', '--rm', '--platform', $Platform, '--entrypoint', 'dotnet', $Image, '--list-sdks')
     $runtimes = Invoke-Docker @('run', '--rm', '--platform', $Platform, '--entrypoint', 'dotnet', $Image, '--list-runtimes')
@@ -85,7 +107,7 @@ Test-Case 'bundled release asset hash and image metadata' {
     if (-not $EngineSha256) { $script:EngineSha256 = $labels.'net.codebelt.csrun.engine.sha256' }
     $hash = Invoke-Docker @('run', '--rm', '--platform', $Platform, '--entrypoint', 'sha256sum', $Image, '/opt/csrun/csrun.ps1')
     Assert-Result $hash 0 "^$EngineSha256 "
-    if ($labels.'net.codebelt.csrun.engine.sha256' -cne $EngineSha256 -or $labels.'net.codebelt.csrun.engine.release' -notmatch '^v\d+\.\d+\.\d+' -or $labels.'net.codebelt.csrun.engine.url' -cne 'https://github.com/codebeltnet/csrun/releases/latest/download/csrun.ps1') { throw 'Engine identity labels are missing or inconsistent.' }
+    if ($labels.'net.codebelt.csrun.engine.sha256' -cne $EngineSha256 -or $labels.'net.codebelt.csrun.engine.release' -notmatch '^v\d+\.\d+\.\d+' -or $labels.'net.codebelt.csrun.engine.url' -cne $EngineUrl) { throw 'Engine identity labels are missing or inconsistent.' }
 }
 foreach ($channel in $channels) {
     Test-Case "console stdin executes net$channel" {
