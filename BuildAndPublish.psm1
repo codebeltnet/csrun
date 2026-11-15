@@ -188,6 +188,8 @@ function BuildAndPublish {
             $normalized = $daemon.Trim().Replace('x86_64', 'amd64').Replace('aarch64', 'arm64')
             if ($normalized -cne $architecture) { throw "Native Docker host required for $architecture; got $normalized. Configure an explicit remote -DockerContext; emulation is insufficient." }
         }
+        & python (Join-Path $PSScriptRoot 'tools/oci.py') check-skopeo
+        if ($LASTEXITCODE -ne 0) { throw 'Skopeo transport prerequisites failed. Remote utility Docker daemons require native Skopeo on the client.' }
         $index = (Invoke-RestMethod 'https://raw.githubusercontent.com/dotnet/core/main/release-notes/releases-index.json').'releases-index'
         $sdks = @($resolvedVersions | ForEach-Object { Get-CsrunSdkRelease $_.FullVersion $index })
         $base = $resolvedVersions | Sort-Object { [version](($_.FullVersion -split '-')[0]) } -Descending | Select-Object -First 1

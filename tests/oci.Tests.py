@@ -200,6 +200,37 @@ class ArtifactTests(unittest.TestCase):
             transfer.assert_not_called()
 
 
+class SkopeoTransportTests(unittest.TestCase):
+    def test_native_skopeo_does_not_need_a_local_docker_daemon(self):
+        with patch.dict('os.environ', {'DOCKER_HOST': 'ssh://builder'}, clear=True), patch.object(oci.shutil, 'which', return_value='/usr/bin/skopeo'), patch.object(oci.subprocess, 'run') as execute, patch.object(oci.subprocess, 'check_output') as inspect:
+            oci.skopeo(['copy', 'oci-archive:client.tar', 'docker://registry/image:11'])
+            execute.assert_called_once_with(['skopeo', 'copy', 'oci-archive:client.tar', 'docker://registry/image:11'], check=True)
+            inspect.assert_not_called()
+
+    def test_remote_environment_host_is_rejected_before_container_launch(self):
+        for host in ('ssh://builder', 'tcp://builder:2376', 'tcp://localhost:2375'):
+            with self.subTest(host=host), patch.dict('os.environ', {'DOCKER_HOST': host}, clear=True), patch.object(oci.shutil, 'which', return_value=None), patch.object(oci.subprocess, 'run') as execute, patch.object(oci.subprocess, 'check_output') as inspect:
+                with self.assertRaisesRegex(ValueError, 'Native Skopeo is required'):
+                    oci.skopeo(['copy', 'oci-archive:client.tar', 'docker://registry/image:11'])
+                execute.assert_not_called()
+                inspect.assert_not_called()
+
+    def test_remote_active_context_is_rejected(self):
+        for environment in ({}, {'DOCKER_CONTEXT': 'remote', 'DOCKER_HOST': 'unix:///var/run/docker.sock'}):
+            with self.subTest(environment=environment), patch.dict('os.environ', environment, clear=True), patch.object(oci.shutil, 'which', return_value=None), patch.object(oci.subprocess, 'check_output', return_value='ssh://builder\n'), patch.object(oci.subprocess, 'run') as execute:
+                with self.assertRaisesRegex(ValueError, 'Native Skopeo is required'):
+                    oci.skopeo(['inspect', '--raw', 'docker://registry/image:11'], capture=True)
+                execute.assert_not_called()
+
+    def test_local_context_overrides_remote_host_and_keeps_container_fallback(self):
+        for host in ('unix:///var/run/docker.sock', 'npipe:////./pipe/docker_engine'):
+            with self.subTest(host=host), patch.dict('os.environ', {'DOCKER_CONTEXT': 'local', 'DOCKER_HOST': 'ssh://builder'}, clear=True), patch.object(oci.shutil, 'which', return_value=None), patch.object(oci.subprocess, 'check_output', return_value=host), patch.object(oci.subprocess, 'run') as execute:
+                oci.skopeo(['copy', 'oci-archive:client.tar', 'docker://registry/image:11'])
+                command = execute.call_args.args[0]
+                self.assertEqual(command[:3], ['docker', 'run', '--rm'])
+                self.assertIn('oci-archive:/archive1/client.tar', command)
+
+
 class DeploymentIdentityTests(unittest.TestCase):
     def test_recovery_from_a_feature_branch_is_rejected(self):
         with patch.dict('os.environ', {'GITHUB_REPOSITORY': 'codebeltnet/csrun', 'RELEASE_TAG': 'v0.2.0', 'GITHUB_EVENT_NAME': 'workflow_dispatch', 'GITHUB_REF': 'refs/heads/feature'}):

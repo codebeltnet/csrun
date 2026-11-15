@@ -140,9 +140,25 @@ def add_bytes(tar, name, data):
     tar.addfile(info, io.BytesIO(data))
 
 
+def check_skopeo():
+    """Require native transport when the utility daemon cannot mount client files."""
+    if shutil.which('skopeo'):
+        return True
+    # DOCKER_CONTEXT overrides DOCKER_HOST, just as it does in the Docker CLI.
+    host = os.environ.get('DOCKER_HOST') if not os.environ.get('DOCKER_CONTEXT') else None
+    if not host:
+        host = subprocess.check_output(
+            ['docker', 'context', 'inspect', '--format', '{{.Endpoints.docker.Host}}'], text=True).strip()
+    require(host.startswith(('unix://', 'npipe://')),
+            'Native Skopeo is required when the active Docker daemon uses SSH or TCP; '
+            'the utility container cannot bind-mount client archives or credentials. '
+            'Install skopeo locally or select a local Docker context.')
+    return False
+
+
 def skopeo(arguments, *, capture=False):
     """Use native Skopeo or a versioned utility container, including on Windows."""
-    if shutil.which('skopeo'):
+    if check_skopeo():
         command = ['skopeo', *arguments]
     else:
         command = ['docker', 'run', '--rm', '--user', '0']
@@ -257,8 +273,8 @@ def publish(args):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('command', choices=['verify', 'merge', 'publish', 'config', 'loaded-config'])
-    parser.add_argument('archive')
+    parser.add_argument('command', choices=['verify', 'merge', 'publish', 'config', 'loaded-config', 'check-skopeo'])
+    parser.add_argument('archive', nargs='?')
     parser.add_argument('--version')
     parser.add_argument('--revision')
     parser.add_argument('--engine')
@@ -270,6 +286,11 @@ def main():
     parser.add_argument('--tags', nargs='+')
     parser.add_argument('inputs', nargs='*')
     args = parser.parse_intermixed_args()
+    if args.command == 'check-skopeo':
+        check_skopeo()
+        return
+    if not args.archive:
+        parser.error('archive is required')
     if args.command == 'merge':
         merge(args)
     elif args.command == 'publish':

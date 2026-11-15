@@ -57,6 +57,23 @@ Test-Case 'a foreign CPU fails before downloads rather than using emulation' {
         } finally { Remove-Item Function:docker }
     }
 }
+Test-Case 'unavailable Skopeo transport fails before downloads or builds' {
+    & $module {
+        function docker { $global:LASTEXITCODE = 0; 'linux/x86_64' }
+        function python {
+            if ($args[-1] -cne 'check-skopeo') { throw 'Expected transport preflight.' }
+            $global:LASTEXITCODE = 1
+        }
+        function Invoke-RestMethod { throw 'External metadata should not be downloaded.' }
+        try {
+            $rejected = $false
+            try { BuildAndPublish 10.0.404 -BuildOnly -Platform linux/amd64 } catch { $rejected = $_ -match 'Remote utility Docker daemons require native Skopeo' }
+            if (-not $rejected) { throw 'Missing native Skopeo was not rejected before construction.' }
+        } finally {
+            Remove-Item Function:docker, Function:python, Function:Invoke-RestMethod
+        }
+    }
+}
 Test-Case 'unsupported/EOL metadata channels fail before exact SDK lookup' {
     $fixture = (Get-Content "$PSScriptRoot/fixtures/releases-index.json" -Raw | ConvertFrom-Json -AsHashtable)['releases-index']
     & $module {
