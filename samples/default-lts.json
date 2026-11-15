@@ -1,0 +1,5 @@
+{
+  "schemaVersion": 1,
+  "mode": "console",
+  "source": "System.Console.WriteLine(\"Hello from the current LTS!\");"
+}
