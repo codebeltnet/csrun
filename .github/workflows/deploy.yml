@@ -67,19 +67,14 @@ jobs:
         run: python tools/release-images.py restore "$SDK_VARIANT"
 
   publish:
-    name: Promote SDK ${{ matrix.sdk }} to Docker Hub
+    name: Promote all SDK images to Docker Hub
     needs: [resolve, verify]
     runs-on: ubuntu-26.04
-    timeout-minutes: 60
+    timeout-minutes: 180
     environment: Production
     permissions:
       contents: read
       actions: read
-    strategy:
-      fail-fast: false
-      max-parallel: 1
-      matrix:
-        sdk: ['10', '11', '10-11']
     steps:
       - uses: codebeltnet/git-checkout@v1
         with:
@@ -88,11 +83,6 @@ jobs:
         with:
           name: resolved-release
           path: resolved
-      - name: Restore exact verified release artifact
-        env:
-          GH_TOKEN: ${{ github.token }}
-          SDK_VARIANT: ${{ matrix.sdk }}
-        run: python tools/release-images.py restore "$SDK_VARIANT"
       - name: Install OCI transfer tool
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends skopeo
       - name: Authenticate, promote without rebuild and inspect registry content
@@ -105,4 +95,15 @@ jobs:
           export REGISTRY_AUTH_FILE="$RUNNER_TEMP/csrun-auth.json"
           trap 'rm -f "$REGISTRY_AUTH_FILE"' EXIT
           printf '%s' "$DOCKERHUB_TOKEN" | skopeo login --authfile "$REGISTRY_AUTH_FILE" --username "$DOCKERHUB_USERNAME" --password-stdin docker.io
-          python tools/release-images.py publish
+          status=0
+          for sdk in 10 11 10-11; do
+            echo "::group::Promote SDK $sdk"
+            if python tools/release-images.py restore "$sdk" && python tools/release-images.py publish; then
+              echo "SDK $sdk promotion succeeded."
+            else
+              echo "::error::SDK $sdk promotion failed."
+              status=1
+            fi
+            echo "::endgroup::"
+          done
+          exit "$status"
