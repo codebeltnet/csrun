@@ -81,11 +81,17 @@ Run the dependency-free regression and integration suite:
 
 ```powershell
 pwsh -NoProfile -File ./tests/csrun.Tests.ps1
+
+# Pin the SDK, even when newer SDKs are also installed
+pwsh -NoProfile -File ./tests/csrun.Tests.ps1 -SdkVersion 11.0.100
+pwsh -NoProfile -File ./tests/csrun.Tests.ps1 -CompatibilityOnly -SdkVersion 10.0.115
 ```
 
 Tests invoke the actual standalone script in child processes, including local scriptblock invocation of the release asset. Fixtures preserve the supplied full DateSpan and Codebelt xUnit examples. DateSpan with Cuemon.Kernel 11.0.0 prints `0 years`, `9 months`, **`40 weeks`**, `273 days`, `6552 hours`, `393,120 minutes`, and `23,587,200 seconds`. Windows is the locally validated platform; paths and process invocation are portable, but Linux/macOS are not yet locally verified.
 
-The test harness disables compiler/MSBuild server reuse so background processes cannot retain analyzer locks in its temporary directory. Assertions remove ANSI colors and terminal hyperlinks; raw stdout/stderr remain available for diagnostics. A regression forces MTP's real ANSI formatter and still requires all three Codebelt output lines. The standalone runner preserves the original child output.
+Both workflows test SDK 11.0.100 and the .NET 10 baseline SDK 10.0.115. The harness writes an isolated `global.json` with roll-forward disabled and verifies the selected SDK, so a newer installed SDK cannot mask minimum-version failures. The compatibility run targets `net10.0` and covers console stdin, forced file execution beside an existing project, and real MTP success, failure, empty discovery, compilation failure, and restore failure.
+
+Both suites include runs with normal compiler/MSBuild server settings, checking exit codes and removal of csrun's own disposable artifacts. These runs retain the normal host temp location for SDK-managed compiler caches; they neither delete those caches nor shut down unrelated servers. The remaining tests disable server reuse to keep their isolated harness directory disposable. Assertions remove ANSI colors and terminal hyperlinks; raw stdout/stderr remain available for diagnostics. A regression forces MTP's real ANSI formatter and still requires all three Codebelt output lines. The standalone runner preserves the original child output.
 
 The workflows follow the [claude-autoupdate release pattern](https://github.com/gimlichael/claude-autoupdate/tree/main/.github/workflows): PR validation; independent validation of a tagged commit; upload of the tested root script; a separate least-privilege job creating a **draft** release from that artifact. Actions are pinned to commit SHAs. No additional repository secrets are needed. GitHub-hosted workflow execution must be verified after an approved push.
 
