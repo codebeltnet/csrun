@@ -125,7 +125,7 @@ def restore(variant, versions=None):
     download(resolved['assets'][f'csrun-{variant}.json'], 'out/release.json')
     meta = json.loads(Path('out/release.json').read_text())
     oci.require(meta['EngineVersion'] == resolved['tag'] and meta['SourceCommit'] == resolved['sha'] and meta['EngineSha256'] == resolved['engine'] and meta['Variant'] == variant, 'Artifact does not represent the resolved latest engine and release')
-    run = gh(f"repos/{os.environ['GITHUB_REPOSITORY']}/actions/runs/{meta['ReleaseRunId']}")
+    run = gh(f"repos/{os.environ['GITHUB_REPOSITORY']}/actions/runs/{meta['ReleaseRunId']}/attempts/{meta['ReleaseRunAttempt']}")
     oci.require(run['event'] == 'push' and run['path'] == '.github/workflows/release.yml' and run['head_sha'] == resolved['sha'] and run['head_branch'] == resolved['tag'] and run['run_attempt'] == int(meta['ReleaseRunAttempt']) and run['conclusion'] == 'success', 'Authoritative tag release run did not succeed')
     if versions is not None:
         oci.require(meta['SdkVersions'] == versions, 'Requested exact SDK versions differ from the saved release; never rebuild on recovery')

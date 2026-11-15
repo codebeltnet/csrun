@@ -183,8 +183,19 @@ class ArtifactTests(unittest.TestCase):
                 'tag': self.args.version, 'sha': self.args.revision, 'engine': self.args.engine, 'assets': assets}))
             run = {'event': 'push', 'path': '.github/workflows/release.yml', 'head_sha': self.args.revision,
                    'head_branch': self.args.version, 'run_attempt': 1, 'conclusion': 'success'}
-            with patch.object(release_images, 'gh', return_value=run), patch.object(release_images.subprocess, 'check_output', return_value=json.dumps(tags)):
+            def get_run(endpoint):
+                if endpoint == 'repos/codebeltnet/csrun/actions/runs/123/attempts/1':
+                    return run
+                if endpoint == 'repos/codebeltnet/csrun/actions/runs/123':
+                    return {**run, 'run_attempt': 2, 'conclusion': 'failure'}
+                self.fail('Unexpected GitHub endpoint: ' + endpoint)
+
+            with patch.object(release_images, 'gh', side_effect=get_run), patch.object(release_images.subprocess, 'check_output', return_value=json.dumps(tags)):
                 release_images.restore('11')
+                for changes in ({'conclusion': 'failure'}, {'run_attempt': 2}, {'head_sha': 'c' * 40}, {'event': 'workflow_dispatch'}, {'path': '.github/workflows/other.yml'}, {'head_branch': 'main'}):
+                    with self.subTest(changes=changes), patch.object(release_images, 'gh', return_value={**run, **changes}):
+                        with self.assertRaisesRegex(ValueError, 'Authoritative tag release run'):
+                            release_images.restore('11')
             self.assertEqual(original, oci.checksum('out/image.tar'))
 
     def test_latest_alias_is_rejected_before_any_registry_upload(self):
