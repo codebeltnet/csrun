@@ -1,0 +1,6 @@
+# GitHub-hosted labels verified against the official runner reference.
+# This supplements actionlint's label inventory; these are not self-hosted jobs.
+self-hosted-runner:
+  labels:
+    - ubuntu-26.04
+    - ubuntu-26.04-arm
