@@ -1,0 +1,4 @@
+*
+!csrun.ps1
+!container-entrypoint.ps1
+!container-build.ps1
