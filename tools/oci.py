@@ -1,5 +1,6 @@
 """Verify, assemble and promote csrun OCI content without rebuilding it (stdlib only)."""
 import argparse
+import contextlib
 import hashlib
 import json
 import os
@@ -58,6 +59,17 @@ class Archive:
         name = 'blobs/' + descriptor['digest'].replace(':', '/')
         require(name in self.members and self.members[name].size == descriptor['size'], 'Missing or truncated OCI content')
         return self.read(name)
+
+    @contextlib.contextmanager
+    def layout(self):
+        """Materialize verified files without restoring tar ownership or modes."""
+        with tempfile.TemporaryDirectory() as temp:
+            for name, member in self.members.items():
+                target = Path(temp) / name
+                target.parent.mkdir(parents=True, exist_ok=True)
+                with self.tar.extractfile(member) as source, target.open('wb') as output:
+                    shutil.copyfileobj(source, output)
+            yield temp
 
     def verify(self, args, platforms):
         runnable = [d for d in self.index['manifests'] if d.get('platform', {}).get('os') == 'linux']
@@ -164,11 +176,12 @@ def skopeo(arguments, *, capture=False):
         command = ['docker', 'run', '--rm', '--user', '0']
         converted = []
         for position, argument in enumerate(arguments):
-            if argument.startswith('oci-archive:'):
-                path = Path(argument[len('oci-archive:'):]).resolve()
+            if argument.startswith(('oci-archive:', 'oci:')):
+                transport, local_path = argument.split(':', 1)
+                path = Path(local_path).resolve()
                 mount = '/archive' + str(position)
                 command.extend(['--volume', str(path.parent) + ':' + mount])
-                argument = 'oci-archive:' + mount + '/' + path.name
+                argument = transport + ':' + mount + '/' + path.name
             converted.append(argument)
         auth = os.environ.get('REGISTRY_AUTH_FILE')
         if auth:
@@ -250,19 +263,21 @@ def publish(args):
     require(args.tags and len({t.rsplit(':', 1)[0] for t in args.tags}) == 1, 'SDK aliases must target one repository')
     for tag in args.tags:
         require(re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._:/-]*:[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}', tag) and tag.rsplit(':', 1)[1] != 'latest', 'Invalid publishing destination')
-    for tag in args.tags:
-        skopeo(['copy', '--all', '--preserve-digests', 'oci-archive:' + args.archive, 'docker://' + tag])
-        raw = skopeo(['inspect', '--raw', 'docker://' + tag], capture=True)
-        index = json.loads(raw)
-        require({d['digest'] for d in index['manifests']} == expected, 'Registry platform/attestation identities changed')
-        digest = 'sha256:' + hashlib.sha256(raw).hexdigest()
-        digests.add(digest)
-        with tempfile.TemporaryDirectory() as temp:
-            downloaded = str(Path(temp) / 'registry.tar')
-            skopeo(['copy', '--all', '--preserve-digests', 'docker://' + tag.rsplit(':', 1)[0] + '@' + digest, 'oci-archive:' + downloaded])
-            Archive(downloaded).verify(args, [args.platform] if getattr(args, 'platform', None) else ['amd64', 'arm64'])
-        print(tag + '@' + digest)
-        published.append({'tag': tag, 'digest': digest})
+    # Skopeo's archive transport restores tar ownership, which fails rootless.
+    with archive.layout() as layout:
+        for tag in args.tags:
+            skopeo(['copy', '--all', '--preserve-digests', 'oci:' + layout, 'docker://' + tag])
+            raw = skopeo(['inspect', '--raw', 'docker://' + tag], capture=True)
+            index = json.loads(raw)
+            require({d['digest'] for d in index['manifests']} == expected, 'Registry platform/attestation identities changed')
+            digest = 'sha256:' + hashlib.sha256(raw).hexdigest()
+            digests.add(digest)
+            with tempfile.TemporaryDirectory() as temp:
+                downloaded = str(Path(temp) / 'registry.tar')
+                skopeo(['copy', '--all', '--preserve-digests', 'docker://' + tag.rsplit(':', 1)[0] + '@' + digest, 'oci-archive:' + downloaded])
+                Archive(downloaded).verify(args, [args.platform] if getattr(args, 'platform', None) else ['amd64', 'arm64'])
+            print(tag + '@' + digest)
+            published.append({'tag': tag, 'digest': digest})
     require(len(digests) == 1, 'SDK aliases resolved to different indexes')
     Path(str(args.archive) + '.published.json').write_bytes(encoded(published))
     summary = os.environ.get('GITHUB_STEP_SUMMARY')
