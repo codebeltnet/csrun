@@ -122,7 +122,11 @@ function Get-ValidatedManifest($InputManifest) {
         throw 'Unsupported schemaVersion; expected integer 1.'
     }
     if ($InputManifest.mode -isnot [string] -or $InputManifest.mode -notin @('console', 'test')) { throw 'Unsupported mode; use console or test.' }
-    $framework = if ($InputManifest.Contains('framework')) { $InputManifest.framework; if ($null -eq $InputManifest.framework) { throw 'Invalid framework; omit the field to select the LTS default.' } } else { $null }
+    $framework = $null
+    if ($InputManifest.Contains('framework')) {
+        if ($InputManifest.framework -isnot [string]) { throw 'Invalid framework; supply a string or omit the field to select the LTS default.' }
+        $framework = $InputManifest.framework
+    }
     if ($InputManifest.source -isnot [string] -or [string]::IsNullOrWhiteSpace($InputManifest.source)) { throw 'source must be a nonempty complete C# program or test source.' }
     $sdk = 'Microsoft.NET.Sdk'
     if ($InputManifest.Contains('sdk')) {
