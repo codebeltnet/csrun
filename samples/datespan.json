@@ -1,0 +1,9 @@
+{
+  "mode": "console",
+  "source": "using System;\nusing System.Globalization;\nusing Cuemon;\n\nnamespace DateExamples;\n\ninternal static class Program\n{\n    private static void Main()\n    {\n        var span = new DateSpan(\n            new DateTime(2018, 1, 1),\n            new DateTime(2018, 10, 1));\n\n        Console.WriteLine($\"{span.Years} years\");\n        Console.WriteLine($\"{span.Months} months\");\n        Console.WriteLine($\"{span.GetWeeks()} weeks\");\n        Console.WriteLine($\"{span.TotalDays} days\");\n        Console.WriteLine($\"{span.TotalHours} hours\");\n        Console.WriteLine(span.TotalMinutes.ToString(\"N0\", CultureInfo.InvariantCulture) + \" minutes\");\n        Console.WriteLine(span.TotalSeconds.ToString(\"N0\", CultureInfo.InvariantCulture) + \" seconds\");\n    }\n}\n",
+  "framework": "net11.0",
+  "dependsOn": [
+    "Cuemon.Kernel@11.0.0"
+  ],
+  "schemaVersion": 1
+}

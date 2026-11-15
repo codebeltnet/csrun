@@ -1,0 +1,7 @@
+{
+  "mode": "console",
+  "source": "System.Console.WriteLine(\"hello\");",
+  "framework": "net11.0",
+  "dependsOn": [],
+  "schemaVersion": 1
+}

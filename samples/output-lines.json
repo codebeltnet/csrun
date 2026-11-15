@@ -1,0 +1,10 @@
+{
+  "mode": "test",
+  "source": "using Codebelt.Extensions.Xunit;\nusing Xunit;\n\nnamespace Example.Tests;\n\npublic class OutputLinesTest : Test\n{\n    public OutputLinesTest(ITestOutputHelper output) : base(output) { }\n\n    [Fact]\n    public void ShouldWriteValuesOnSeparateLines()\n    {\n        TestOutput.WriteLines(\"started\", 2, \"finished\");\n        Assert.True(HasTestOutput);\n    }\n}\n",
+  "framework": "net11.0",
+  "dependsOn": [
+    "Codebelt.Extensions.Xunit@13.0.0",
+    "xunit.v3@4.0.3"
+  ],
+  "schemaVersion": 1
+}
