@@ -85,6 +85,8 @@ pwsh -NoProfile -File ./tests/csrun.Tests.ps1
 
 Tests invoke the actual standalone script in child processes, including local scriptblock invocation of the release asset. Fixtures preserve the supplied full DateSpan and Codebelt xUnit examples. DateSpan with Cuemon.Kernel 11.0.0 prints `0 years`, `9 months`, **`40 weeks`**, `273 days`, `6552 hours`, `393,120 minutes`, and `23,587,200 seconds`. Windows is the locally validated platform; paths and process invocation are portable, but Linux/macOS are not yet locally verified.
 
+The test harness disables compiler/MSBuild server reuse so background processes cannot retain analyzer locks in its temporary directory. Assertions remove ANSI colors and terminal hyperlinks; raw stdout/stderr remain available for diagnostics. A regression forces MTP's real ANSI formatter and still requires all three Codebelt output lines. The standalone runner preserves the original child output.
+
 The workflows follow the [claude-autoupdate release pattern](https://github.com/gimlichael/claude-autoupdate/tree/main/.github/workflows): PR validation; independent validation of a tagged commit; upload of the tested root script; a separate least-privilege job creating a **draft** release from that artifact. Actions are pinned to commit SHAs. No additional repository secrets are needed. GitHub-hosted workflow execution must be verified after an approved push.
 
 To make the initial release, after reviewing and approving this local change:

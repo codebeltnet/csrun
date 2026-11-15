@@ -10,6 +10,12 @@ $null = New-Item -ItemType Directory -Path $root
 $passed = 0
 $failed = 0
 
+function Remove-TerminalFormatting([string] $Text) {
+    # CSI sequences color text; OSC sequences can wrap paths in terminal hyperlinks.
+    $Text = $Text -replace '\x1B\[[0-?]*[ -/]*[@-~]', ''
+    return $Text -replace '\x1B\][^\x07\x1B]*(?:\x07|\x1B\\)', ''
+}
+
 function Invoke-Runner {
     param([hashtable] $Arguments, [switch] $ScriptBlock, [hashtable] $Environment = @{}, [string] $WorkingDirectory = $root, [string] $ClipboardText = '', [switch] $ClipboardFailure)
     $payload = @{ path = $runner; arguments = $Arguments; scriptblock = [bool]$ScriptBlock; clipboardText = $ClipboardText; clipboardFailure = [bool]$ClipboardFailure } | ConvertTo-Json -Depth 12 -Compress
@@ -38,6 +44,11 @@ exit $LASTEXITCODE
     $start.Environment['DOTNET_NOLOGO'] = '1'
     $start.Environment['DOTNET_CLI_TELEMETRY_OPTOUT'] = '1'
     $start.Environment['TESTINGPLATFORM_TELEMETRY_OPTOUT'] = '1'
+    # These children own their temp directory. Persistent build servers would
+    # retain analyzer DLL locks there after the runner process has exited.
+    $start.Environment['UseSharedCompilation'] = 'false'
+    $start.Environment['MSBUILDDISABLENODEREUSE'] = '1'
+    $start.Environment['DOTNET_CLI_USE_MSBUILD_SERVER'] = '0'
     foreach ($tempVariable in @('TEMP', 'TMP', 'TMPDIR')) { $start.Environment[$tempVariable] = $root }
     foreach ($key in $Environment.Keys) { $start.Environment[$key] = $Environment[$key] }
     $process = [Diagnostics.Process]::Start($start)
@@ -45,7 +56,9 @@ exit $LASTEXITCODE
         $stdout = $process.StandardOutput.ReadToEndAsync()
         $stderr = $process.StandardError.ReadToEndAsync()
         if (-not $process.WaitForExit(180000)) { $process.Kill($true); throw 'Runner timed out after 180 seconds.' }
-        return @{ Code = $process.ExitCode; Out = $stdout.GetAwaiter().GetResult(); Err = $stderr.GetAwaiter().GetResult() }
+        $rawOut = $stdout.GetAwaiter().GetResult()
+        $rawErr = $stderr.GetAwaiter().GetResult()
+        return @{ Code = $process.ExitCode; Out = (Remove-TerminalFormatting $rawOut); Err = (Remove-TerminalFormatting $rawErr); RawOut = $rawOut; RawErr = $rawErr }
     } finally { $process.Dispose() }
 }
 function New-Manifest([string] $Source = 'System.Console.WriteLine("hello");', [string] $Mode = 'console', [string[]] $Pins = @()) {
@@ -58,6 +71,13 @@ function Assert-Result($Result, [int] $Code = 0, [string] $Pattern = '') {
     $all = $Result.Out + "`n" + $Result.Err
     if ($Result.Code -ne $Code -or ($Pattern -and $all -notmatch $Pattern)) {
         throw "Expected exit $Code and /$Pattern/, got exit $($Result.Code):`n$all"
+    }
+}
+function Assert-LiveOutput($Result) {
+    foreach ($line in @('started', '2', 'finished')) {
+        if (($Result.Out + "`n" + $Result.Err) -notmatch "(?m)^OUTPUT: .*\] $line\r?$") {
+            throw "Missing live output: $line`nstdout:`n$($Result.RawOut)`nstderr:`n$($Result.RawErr)"
+        }
     }
 }
 function Test-Case([string] $Name, [scriptblock] $Body) {
@@ -79,7 +99,33 @@ try {
         if ($manifest.source -cne (Get-Content "$PSScriptRoot/fixtures/OutputLinesTest.cs" -Raw)) { throw 'Test source differs from original fixture.' }
         $result = Invoke-Manifest $manifest
         Assert-Result $result 0 '(?s)total: 1.*failed: 0.*succeeded: 1.*skipped: 0'
-        foreach ($line in @('started', '2', 'finished')) { if ($result.Out -notmatch "(?m)^OUTPUT: .*\] $line\r?$") { throw "Missing live output: $line" } }
+        Assert-LiveOutput $result
+    }
+    Test-Case 'real MTP ANSI live output and hyperlinked artifact paths' {
+        # Force MTP's real ANSI formatter regardless of the current terminal.
+        $originalRunner = $script:runner
+        $ansiRunner = Join-Path $root 'ansi-runner.ps1'
+        $text = [IO.File]::ReadAllText($originalRunner)
+        $ansiText = $text.Replace('--progress off --no-banner', '--progress off --no-banner --ansi on')
+        if ($ansiText -ceq $text) { throw 'Could not enable the MTP ANSI formatter for this regression.' }
+        [IO.File]::WriteAllText($ansiRunner, $ansiText)
+        try {
+            $script:runner = $ansiRunner
+            $m = Get-Content "$PSScriptRoot/../samples/output-lines.json" -Raw | ConvertFrom-Json -AsHashtable
+            $result = Invoke-Manifest $m
+            Assert-Result $result 0 '(?s)total: 1.*succeeded: 1'
+            if (-not $result.RawOut.Contains([string][char]27)) { throw 'MTP did not emit ANSI formatting.' }
+            Assert-LiveOutput $result
+            if ($result.Out.Contains([string][char]27)) { throw 'Terminal formatting remains in assertion output.' }
+            if ($result.Out -notmatch ' - (?<path>[^\r\n]+Sample\.dll) \(') { throw 'Could not read the unformatted artifact path.' }
+            if (Test-Path -LiteralPath $Matches.path) { throw 'ANSI run leaked test artifacts.' }
+        } finally { $script:runner = $originalRunner }
+    }
+    Test-Case 'isolated builds leave no compiler server analyzer cache' {
+        # Force a unique pipe so an already-running local compiler cannot mask
+        # the fresh-runner behavior seen in CI. Shared compilation stays disabled.
+        Assert-Result (Invoke-Runner @{Source='System.Console.WriteLine("isolated-build");'} -Environment @{SharedCompilationId=('csrun-regression-' + [guid]::NewGuid().ToString('N'))}) 0 'isolated-build'
+        if (Test-Path -LiteralPath (Join-Path $root 'VBCSCompiler')) { throw 'A compiler server retained an analyzer cache inside the owned temporary directory.' }
     }
     Test-Case 'assertion failure retains MTP exit 2 and diagnostic' {
         Assert-Result (Invoke-Manifest (New-Manifest 'using Xunit; public class Tests { [Fact] public void Fails() { Assert.Equal(1, 2); } }' test)) 2 'Assert.Equal\(\) Failure'
@@ -277,7 +323,8 @@ public class Tests {
 } finally {
     $resolvedRoot = [IO.Path]::GetFullPath($root)
     if (-not $resolvedRoot.StartsWith([IO.Path]::GetFullPath([IO.Path]::GetTempPath())) -or [IO.Path]::GetFileName($resolvedRoot) -notlike 'csrun-tests-*') { throw 'Unsafe test cleanup path.' }
-    Remove-Item -LiteralPath $resolvedRoot -Recurse -Force
+    try { Remove-Item -LiteralPath $resolvedRoot -Recurse -Force }
+    catch { $failed++; Write-Host "FAIL test harness cleanup: $_" }
 }
 Write-Host "Tests: $passed passed, $failed failed"
 if ($failed -gt 0) { exit 1 }
