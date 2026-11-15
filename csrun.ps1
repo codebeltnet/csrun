@@ -318,4 +318,4 @@ try {
     }
 }
 $global:LASTEXITCODE = $exitCode
-if ($MyInvocation.MyCommand.Path) { exit $exitCode }
+if ($MyInvocation.MyCommand -is [System.Management.Automation.ExternalScriptInfo]) { exit $exitCode }
