@@ -13,6 +13,9 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  containers:
+    uses: ./.github/workflows/container.yml
+
   test:
     name: Windows .NET 11 integration tests
     runs-on: windows-latest
@@ -37,7 +40,7 @@ jobs:
           if (-not $sdk) { throw 'Codebelt did not provide a .NET 11 GA SDK.' }
           pwsh -NoProfile -File ./tests/csrun.Tests.ps1 -SdkVersion $sdk
       - name: Upload tested script
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: csrun-snapshot-${{ github.run_number }}-${{ github.run_attempt }}
           path: csrun.ps1

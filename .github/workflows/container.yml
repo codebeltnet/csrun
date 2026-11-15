@@ -1,0 +1,56 @@
+name: Container validation
+
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  container:
+    name: Ubuntu ${{ matrix.arch.name }} SDK ${{ matrix.sdk }}
+    runs-on: ${{ matrix.arch.runner }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        sdk: ['10', '11', '10-11']
+        arch:
+          - { name: amd64, runner: ubuntu-24.04 }
+          - { name: arm64, runner: ubuntu-24.04-arm }
+    steps:
+      - name: Checkout packaging source
+        uses: codebeltnet/git-checkout@v1
+        with:
+          ref: ${{ github.sha }}
+      - name: Install supported GA SDK channels for exact build selection
+        uses: codebeltnet/install-dotnet@v3
+        with:
+          versionPrecision: patch
+      - name: Validate publishing contract
+        shell: pwsh
+        run: ./tests/BuildAndPublish.Tests.ps1
+      - name: Build and test latest released engine in explicit SDK environment
+        shell: pwsh
+        env:
+          SDK_CHANNELS: ${{ matrix.sdk }}
+          TARGET_PLATFORM: linux/${{ matrix.arch.name }}
+        run: |
+          $installed = @(& dotnet --list-sdks)
+          if ($LASTEXITCODE -ne 0) { throw 'Unable to list installed SDKs.' }
+          $versions = foreach ($major in $env:SDK_CHANNELS.Split('-')) {
+              $sdk = $installed | ForEach-Object {
+                  if ($_ -match "^($major\.0\.\d+)\s+\[") { $Matches[1] }
+              } | Sort-Object { [version]$_ } -Descending | Select-Object -First 1
+              if (-not $sdk) { throw "Codebelt did not provide a .NET $major GA SDK." }
+              $sdk
+          }
+          Import-Module ./BuildAndPublish.psm1 -Force
+          BuildAndPublish -SdkVersion $versions -Platform $env:TARGET_PLATFORM -BuildOnly -PassThru |
+              Format-List
+      - name: Upload image validation metadata
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: container-${{ matrix.sdk }}-${{ matrix.arch.name }}-${{ github.run_attempt }}
+          path: artifacts/*.json
+          if-no-files-found: error
