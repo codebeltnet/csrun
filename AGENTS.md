@@ -14,6 +14,8 @@
 - Reference actions and reusable workflows with floating version tags, not commit SHAs.
 - Use external actions only where the Codebelt ecosystem has no suitable equivalent.
 
+- Use fixed `ubuntu-26.04` (AMD64) and `ubuntu-26.04-arm` (ARM64) runners for every Linux job. Never use `ubuntu-latest` or older Ubuntu runner labels. Keep Windows validation on `windows-2025`; runner upgrades require review.
+
 ## .NET support policy
 
 - Use only .NET 10 and later SDKs, runtimes, and application/test target frameworks. Do not introduce .NET 8, .NET 9, or older execution targets.

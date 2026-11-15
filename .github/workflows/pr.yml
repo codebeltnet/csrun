@@ -13,9 +13,12 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  containers:
+    uses: ./.github/workflows/container.yml
+
   test:
     name: Windows .NET 11 integration tests
-    runs-on: windows-latest
+    runs-on: windows-2025
     timeout-minutes: 20
     steps:
       - name: Checkout
@@ -46,7 +49,7 @@ jobs:
 
   compatibility:
     name: Windows .NET 10 compatibility
-    runs-on: windows-latest
+    runs-on: windows-2025
     timeout-minutes: 10
     steps:
       - name: Checkout
@@ -67,3 +70,13 @@ jobs:
           } | Sort-Object { [version]$_ } -Descending | Select-Object -First 1
           if (-not $sdk) { throw 'Codebelt did not provide a .NET 10 GA SDK.' }
           pwsh -NoProfile -File ./tests/csrun.Tests.ps1 -CompatibilityOnly -SdkVersion $sdk
+
+  quality:
+    name: Required quality gate
+    if: always()
+    needs: [test, compatibility, containers]
+    runs-on: ubuntu-26.04
+    steps:
+      - env:
+          RESULTS: ${{ toJSON(needs) }}
+        run: echo "$RESULTS" | jq -e 'all(.[]; .result == "success")'

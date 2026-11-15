@@ -1,0 +1,108 @@
+name: Deploy Docker Hub images
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Published latest release to recover; existing verified artifacts only
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: csrun-production
+  cancel-in-progress: false
+
+jobs:
+  resolve:
+    name: Resolve latest published engine once
+    runs-on: ubuntu-26.04
+    timeout-minutes: 60
+    outputs:
+      sha: ${{ steps.resolve.outputs.sha }}
+    steps:
+      - uses: codebeltnet/git-checkout@v1
+        with:
+          ref: main
+      - id: resolve
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.event.release.tag_name || inputs.tag }}
+        run: python tools/release-images.py resolve
+      - uses: actions/upload-artifact@v7
+        with:
+          name: resolved-release
+          path: resolved/*
+          retention-days: 7
+          if-no-files-found: error
+
+  verify:
+    name: Validate saved SDK ${{ matrix.sdk }} release artifact
+    needs: resolve
+    runs-on: ubuntu-26.04
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      actions: read
+    strategy:
+      fail-fast: false
+      matrix:
+        sdk: ['10', '11', '10-11']
+    steps:
+      - uses: codebeltnet/git-checkout@v1
+        with:
+          ref: ${{ needs.resolve.outputs.sha }}
+      - uses: actions/download-artifact@v8
+        with:
+          name: resolved-release
+          path: resolved
+      - name: Validate release run, native results, checksums and attestations
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SDK_VARIANT: ${{ matrix.sdk }}
+        run: python tools/release-images.py restore "$SDK_VARIANT"
+
+  publish:
+    name: Promote SDK ${{ matrix.sdk }} to Docker Hub
+    needs: [resolve, verify]
+    runs-on: ubuntu-26.04
+    timeout-minutes: 60
+    environment: Production
+    permissions:
+      contents: read
+      actions: read
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        sdk: ['10', '11', '10-11']
+    steps:
+      - uses: codebeltnet/git-checkout@v1
+        with:
+          ref: ${{ needs.resolve.outputs.sha }}
+      - uses: actions/download-artifact@v8
+        with:
+          name: resolved-release
+          path: resolved
+      - name: Restore exact verified release artifact
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SDK_VARIANT: ${{ matrix.sdk }}
+        run: python tools/release-images.py restore "$SDK_VARIANT"
+      - name: Install OCI transfer tool
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends skopeo
+      - name: Authenticate, promote without rebuild and inspect registry content
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          export REGISTRY_AUTH_FILE="$RUNNER_TEMP/csrun-auth.json"
+          trap 'rm -f "$REGISTRY_AUTH_FILE"' EXIT
+          printf '%s' "$DOCKERHUB_TOKEN" | skopeo login --authfile "$REGISTRY_AUTH_FILE" --username "$DOCKERHUB_USERNAME" --password-stdin docker.io
+          python tools/release-images.py publish

@@ -1,0 +1,81 @@
+name: Container validation
+
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  container:
+    name: Native ${{ matrix.arch.architecture }} SDK ${{ matrix.sdk }}
+    runs-on: ${{ matrix.arch.runner }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        sdk: ['10', '11', '10-11']
+        arch:
+          - { architecture: amd64, runner: ubuntu-26.04 }
+          - { architecture: arm64, runner: ubuntu-26.04-arm }
+    steps:
+      - uses: codebeltnet/git-checkout@v1
+        with:
+          ref: ${{ github.sha }}
+      - uses: codebeltnet/install-dotnet@v3
+        with:
+          versionPrecision: patch
+      - name: Install OCI transfer tool
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends skopeo
+      - name: Enable OCI exporter
+        run: docker buildx create --driver docker-container --use
+      - name: Validate OCI integrity and promotion contracts
+        run: python tests/oci.Tests.py
+      - name: Validate publishing contract
+        shell: pwsh
+        run: ./tests/BuildAndPublish.Tests.ps1
+      - name: Build once and execute exported candidate on native CPU
+        shell: pwsh
+        env:
+          SDK_CHANNELS: ${{ matrix.sdk }}
+          TARGET_PLATFORM: linux/${{ matrix.arch.architecture }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $installed = @(& dotnet --list-sdks)
+          if ($LASTEXITCODE -ne 0) { throw 'Unable to list installed SDKs.' }
+          $versions = foreach ($major in $env:SDK_CHANNELS.Split('-')) {
+              $sdk = $installed | ForEach-Object {
+                  if ($_ -match "^($major\.0\.\d+)\s+\[") { $Matches[1] }
+              } | Sort-Object { [version]$_ } -Descending | Select-Object -First 1
+              if (-not $sdk) { throw "Codebelt did not provide a .NET $major GA SDK." }
+              $sdk
+          }
+          $version = if ($env:GITHUB_REF_TYPE -eq 'tag') { $env:GITHUB_REF_NAME } else { 'v0.2.0' }
+          Import-Module ./BuildAndPublish.psm1 -Force
+          BuildAndPublish -SdkVersion $versions -Platform $env:TARGET_PLATFORM -EnginePath ./csrun.ps1 -EngineVersion $version -BuildOnly -PassThru | Format-List
+      - name: Preserve exact tested OCI content and native result
+        if: github.event_name == 'push' && github.ref_type == 'tag'
+        uses: actions/upload-artifact@v7
+        with:
+          name: container-${{ matrix.sdk }}--${{ matrix.arch.architecture }}
+          path: artifacts/*
+          compression-level: 0
+          if-no-files-found: error
+          retention-days: 1
+      - name: Preserve PR validation metadata without large image transfers
+        if: github.event_name != 'push' || github.ref_type != 'tag'
+        uses: actions/upload-artifact@v7
+        with:
+          name: container-metadata-${{ matrix.sdk }}--${{ matrix.arch.architecture }}-${{ github.run_attempt }}
+          path: artifacts/*.json
+          if-no-files-found: error
+          retention-days: 7
+  quality:
+    name: Both native architectures and all SDK variants
+    if: always()
+    needs: [container]
+    runs-on: ubuntu-26.04
+    steps:
+      - env:
+          RESULT: ${{ needs.container.result }}
+        run: test "$RESULT" = success

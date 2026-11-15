@@ -12,9 +12,12 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  containers:
+    uses: ./.github/workflows/container.yml
+
   test:
     name: Test tagged script
-    runs-on: windows-latest
+    runs-on: windows-2025
     timeout-minutes: 20
     steps:
       - name: Validate release version
@@ -51,7 +54,7 @@ jobs:
 
   compatibility:
     name: Test tagged script on .NET 10
-    runs-on: windows-latest
+    runs-on: windows-2025
     timeout-minutes: 10
     steps:
       - name: Checkout tagged commit
@@ -73,20 +76,79 @@ jobs:
           if (-not $sdk) { throw 'Codebelt did not provide a .NET 10 GA SDK.' }
           pwsh -NoProfile -File ./tests/csrun.Tests.ps1 -CompatibilityOnly -SdkVersion $sdk
 
+  images:
+    name: Preserve verified SDK ${{ matrix.sdk }} index
+    timeout-minutes: 45
+    needs: [test, compatibility, containers]
+    runs-on: ubuntu-26.04
+    strategy:
+      fail-fast: false
+      matrix:
+        sdk: ['10', '11', '10-11']
+    steps:
+      - uses: codebeltnet/git-checkout@v1
+        with:
+          ref: ${{ github.sha }}
+      - uses: codebeltnet/install-dotnet@v3
+        with:
+          versionPrecision: patch
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: container-${{ matrix.sdk }}--*
+          path: inputs
+      - name: Assemble exact native-tested content
+        env:
+          SDK_VARIANT: ${{ matrix.sdk }}
+        run: python tools/release-images.py assemble "$SDK_VARIANT"
+      - id: identity
+        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+      - uses: codebeltnet/oci-artifact-verify@v1
+        with:
+          archive-path: ${{ github.workspace }}/out/image.tar
+          checksum-path: ${{ github.workspace }}/out/image.tar.sha256
+          version: ${{ steps.identity.outputs.version }}
+          revision: ${{ github.sha }}
+      - name: Split release assets below GitHub's per-file limit
+        env:
+          SDK_VARIANT: ${{ matrix.sdk }}
+        run: python tools/release-images.py split "$SDK_VARIANT"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: release-image-${{ matrix.sdk }}
+          path: assets/*
+          compression-level: 0
+          retention-days: 1
+          if-no-files-found: error
+
   release:
     name: Create draft release
-    needs: [test, compatibility]
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
+    needs: [test, compatibility, containers, images]
+    runs-on: ubuntu-26.04
+    timeout-minutes: 15
     permissions:
-      actions: read
+      actions: write
       contents: write
     env:
       GH_TOKEN: ${{ github.token }}
       GH_REPO: ${{ github.repository }}
       RELEASE_TAG: ${{ github.ref_name }}
     steps:
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: release-image-*
+          path: release
+          merge-multiple: true
       - name: Download tested script
         run: gh run download "$GITHUB_RUN_ID" --name "csrun-$RELEASE_TAG" --dir release
-      - name: Create draft with tested standalone asset
-        run: gh release create "$RELEASE_TAG" release/csrun.ps1 --verify-tag --draft --generate-notes --title "$RELEASE_TAG"
+      - name: Create draft with tested engine and OCI assets
+        run: |
+          cd release
+          sha256sum csrun.ps1 > csrun.ps1.sha256
+          gh release create "$RELEASE_TAG" ./* --verify-tag --draft --generate-notes --title "$RELEASE_TAG"
+      - name: Remove transient CI copies after durable release attachment
+        continue-on-error: true
+        run: |
+          gh api "repos/$GH_REPO/actions/runs/$GITHUB_RUN_ID/artifacts?per_page=100" --jq '.artifacts[].id' |
+            while read -r artifact_id; do
+              gh api --method DELETE "repos/$GH_REPO/actions/artifacts/$artifact_id"
+            done
