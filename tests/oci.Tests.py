@@ -210,8 +210,68 @@ class ArtifactTests(unittest.TestCase):
                 oci.publish(self.args)
             transfer.assert_not_called()
 
+    def test_publish_uses_owner_independent_layout_and_preserves_verified_bytes(self):
+        amd, _, _ = self.fixture('amd64')
+        arm, _, _ = self.fixture('arm64')
+        self.args.archive = str(self.root / 'combined.tar')
+        self.args.inputs = [str(amd), str(arm)]
+        self.args.tags = ['docker.io/fork/csrun:11.0.100', 'docker.io/fork/csrun:11']
+        oci.merge(self.args)
+        original = oci.checksum(self.args.archive)
+        archive = oci.Archive(self.args.archive)
+        layouts = []
+
+        def transfer(arguments, *, capture=False):
+            if arguments[0] == 'inspect':
+                return oci.encoded(archive.index)
+            self.assertEqual(arguments[:3], ['copy', '--all', '--preserve-digests'])
+            if arguments[3].startswith('docker://'):
+                shutil.copyfile(self.args.archive, arguments[4].removeprefix('oci-archive:'))
+                return
+            self.assertTrue(arguments[3].startswith('oci:'))
+            layout = Path(arguments[3].removeprefix('oci:'))
+            layouts.append(layout)
+            self.assertEqual({p.relative_to(layout).as_posix() for p in layout.rglob('*') if p.is_file()}, set(archive.members))
+            for name, member in archive.members.items():
+                with archive.tar.extractfile(member) as source:
+                    self.assertEqual((layout / name).read_bytes(), source.read())
+
+        with patch.object(oci, 'skopeo', side_effect=transfer), patch.object(oci.tarfile.TarFile, 'chown', side_effect=PermissionError('ownership restoration forbidden')):
+            oci.publish(self.args)
+        archive.tar.close()
+        self.assertEqual(len(layouts), 2)
+        self.assertEqual(layouts[0], layouts[1])
+        self.assertFalse(layouts[0].exists())
+        self.assertEqual(original, oci.checksum(self.args.archive))
+        self.assertEqual(len(json.loads(Path(self.args.archive + '.published.json').read_text())), 2)
+
+    def test_publish_removes_temporary_layout_after_transfer_failure(self):
+        path, _, _ = self.fixture('amd64')
+        self.args.archive = str(path)
+        self.args.platform = 'amd64'
+        self.args.tags = ['docker.io/fork/csrun:11']
+        layouts = []
+
+        def fail_transfer(arguments):
+            layouts.append(Path(arguments[3].removeprefix('oci:')))
+            self.assertTrue(layouts[-1].is_dir())
+            raise RuntimeError('transfer failed')
+
+        with patch.object(oci, 'skopeo', side_effect=fail_transfer):
+            with self.assertRaisesRegex(RuntimeError, 'transfer failed'):
+                oci.publish(self.args)
+        self.assertFalse(layouts[0].exists())
+        self.assertFalse(Path(str(path) + '.published.json').exists())
+
 
 class SkopeoTransportTests(unittest.TestCase):
+    def test_local_container_mounts_oci_layout_directory(self):
+        with patch.dict('os.environ', {'DOCKER_HOST': 'unix:///var/run/docker.sock'}, clear=True), patch.object(oci.shutil, 'which', return_value=None), patch.object(oci.subprocess, 'run') as execute:
+            oci.skopeo(['copy', '--all', '--preserve-digests', 'oci:client-layout', 'docker://registry/image:11'])
+            command = execute.call_args.args[0]
+            self.assertIn('oci:/archive3/client-layout', command)
+            self.assertIn(str(Path('client-layout').resolve().parent) + ':/archive3', command)
+
     def test_native_skopeo_does_not_need_a_local_docker_daemon(self):
         with patch.dict('os.environ', {'DOCKER_HOST': 'ssh://builder'}, clear=True), patch.object(oci.shutil, 'which', return_value='/usr/bin/skopeo'), patch.object(oci.subprocess, 'run') as execute, patch.object(oci.subprocess, 'check_output') as inspect:
             oci.skopeo(['copy', 'oci-archive:client.tar', 'docker://registry/image:11'])
