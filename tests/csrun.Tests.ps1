@@ -1,6 +1,10 @@
 #requires -Version 7.0
 [CmdletBinding()]
-param()
+param(
+    [switch] $CompatibilityOnly,
+    [ValidatePattern('^[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?$')]
+    [string] $SdkVersion
+)
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 $runner = (Resolve-Path "$PSScriptRoot/../csrun.ps1").Path
@@ -17,7 +21,7 @@ function Remove-TerminalFormatting([string] $Text) {
 }
 
 function Invoke-Runner {
-    param([hashtable] $Arguments, [switch] $ScriptBlock, [hashtable] $Environment = @{}, [string] $WorkingDirectory = $root, [string] $ClipboardText = '', [switch] $ClipboardFailure)
+    param([hashtable] $Arguments, [switch] $ScriptBlock, [hashtable] $Environment = @{}, [string] $WorkingDirectory = $root, [string] $ClipboardText = '', [switch] $ClipboardFailure, [switch] $NormalBuildServers)
     $payload = @{ path = $runner; arguments = $Arguments; scriptblock = [bool]$ScriptBlock; clipboardText = $ClipboardText; clipboardFailure = [bool]$ClipboardFailure } | ConvertTo-Json -Depth 12 -Compress
     $encodedPayload = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($payload))
     $command = @'
@@ -44,12 +48,17 @@ exit $LASTEXITCODE
     $start.Environment['DOTNET_NOLOGO'] = '1'
     $start.Environment['DOTNET_CLI_TELEMETRY_OPTOUT'] = '1'
     $start.Environment['TESTINGPLATFORM_TELEMETRY_OPTOUT'] = '1'
-    # These children own their temp directory. Persistent build servers would
-    # retain analyzer DLL locks there after the runner process has exited.
-    $start.Environment['UseSharedCompilation'] = 'false'
-    $start.Environment['MSBUILDDISABLENODEREUSE'] = '1'
-    $start.Environment['DOTNET_CLI_USE_MSBUILD_SERVER'] = '0'
-    foreach ($tempVariable in @('TEMP', 'TMP', 'TMPDIR')) { $start.Environment[$tempVariable] = $root }
+    if ($NormalBuildServers) {
+        # Match the shipped script's defaults, even when the parent opted out of
+        # server reuse. Leave compiler caches in the normal host temp location;
+        # only csrun's own disposable artifacts must be removed by the runner.
+        foreach ($name in @('UseSharedCompilation', 'MSBUILDDISABLENODEREUSE', 'DOTNET_CLI_USE_MSBUILD_SERVER')) { $null = $start.Environment.Remove($name) }
+    } else {
+        $start.Environment['UseSharedCompilation'] = 'false'
+        $start.Environment['MSBUILDDISABLENODEREUSE'] = '1'
+        $start.Environment['DOTNET_CLI_USE_MSBUILD_SERVER'] = '0'
+        foreach ($tempVariable in @('TEMP', 'TMP', 'TMPDIR')) { $start.Environment[$tempVariable] = $root }
+    }
     foreach ($key in $Environment.Keys) { $start.Environment[$key] = $Environment[$key] }
     $process = [Diagnostics.Process]::Start($start)
     try {
@@ -80,14 +89,71 @@ function Assert-LiveOutput($Result) {
         }
     }
 }
+function Assert-TestArtifactsRemoved($Result) {
+    $all = $Result.Out + "`n" + $Result.Err
+    $paths = [regex]::Matches($all, '(?:[A-Za-z]:[\\/]|/)[^\r\n]*?csrun-[a-f0-9]{32}(?=[\\/])')
+    if ($paths.Count -eq 0) { throw "No disposable test artifact path in output:`n$all" }
+    foreach ($path in ($paths.Value | Select-Object -Unique)) {
+        if (Test-Path -LiteralPath $path) { throw "Leaked test artifacts: $path" }
+    }
+}
 function Test-Case([string] $Name, [scriptblock] $Body) {
     try { & $Body; $script:passed++; Write-Host "PASS $Name" }
     catch { $script:failed++; Write-Host "FAIL $Name`n$_" }
 }
 try {
+    if ($CompatibilityOnly -and (-not $SdkVersion -or -not $SdkVersion.StartsWith('10.'))) { throw 'CompatibilityOnly requires an explicit .NET 10 SdkVersion.' }
+    if ($SdkVersion) {
+        @{sdk=@{version=$SdkVersion; rollForward='disable'}} | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $root 'global.json') -Encoding utf8
+        Push-Location $root
+        try {
+            $selectedSdk = & dotnet --version
+            if ($LASTEXITCODE -ne 0 -or $selectedSdk -cne $SdkVersion) { throw "Expected SDK $SdkVersion, selected '$selectedSdk'." }
+            Write-Host "Testing SDK $selectedSdk (roll-forward disabled)"
+        } finally { Pop-Location }
+    }
+    $executionFramework = if ($CompatibilityOnly) { 'net10.0' } else { 'net11.0' }
+    $runtimeMajor = if ($CompatibilityOnly) { 10 } else { 11 }
+    Test-Case 'normal servers: stdin console executes on the requested runtime' {
+        $source = 'System.Console.WriteLine("runtime:" + System.Environment.Version.Major);'
+        Assert-Result (Invoke-Runner @{Framework=$executionFramework; Source=$source} -NormalBuildServers) 0 "(?m)^runtime:$runtimeMajor\r?$"
+        if (@(Get-ChildItem $root -Filter *.csproj).Count) { throw 'Stdin execution created a user project.' }
+    }
+    Test-Case 'normal servers: existing project forces file execution, exit 23 and cleanup' {
+        $dir = Join-Path $root 'normal-existing-project'; $null = New-Item -ItemType Directory $dir
+        "<Project Sdk=`"Microsoft.NET.Sdk`"><PropertyGroup><TargetFramework>$executionFramework</TargetFramework></PropertyGroup><Target Name=`"Reject`" BeforeTargets=`"Build`"><Error Text=`"WRONG PROJECT`" /></Target></Project>" | Set-Content "$dir/existing.csproj"
+        $source = 'System.Console.WriteLine("runtime:" + System.Environment.Version.Major); System.Console.WriteLine("CSRUN_ARTIFACT:" + System.AppContext.GetData("EntryPointFileDirectoryPath")); System.Console.Error.WriteLine("expected stderr"); return 23;'
+        $result = Invoke-Runner @{Framework=$executionFramework; Source=$source} -WorkingDirectory $dir -NormalBuildServers
+        Assert-Result $result 23 "(?m)^runtime:$runtimeMajor\r?$"
+        if ($result.Err -notmatch 'expected stderr') { throw 'Child stderr was lost.' }
+        if ($result.Out -notmatch '(?m)^CSRUN_ARTIFACT:(?<path>[^\r\n]+)\r?$') { throw 'No file-based source artifact path.' }
+        $path = $Matches.path
+        if ([IO.Path]::GetFileName($path) -notmatch '^csrun-[a-f0-9]{32}$') { throw "Unexpected source artifact directory: $path" }
+        if (Test-Path -LiteralPath $path) { throw "Leaked console source artifacts: $path" }
+    }
+    $normalCases = @(
+        @{Name='passing tests'; Source='using Xunit; public class T { [Fact] public void Pass() {} }'; Code=0; Pattern='succeeded: 1'},
+        @{Name='failed tests'; Source='using Xunit; public class T { [Fact] public void Fail() { Assert.Equal(1, 2); } }'; Code=2; Pattern='Assert.Equal\(\) Failure'},
+        @{Name='zero tests'; Source='public class NoTests {}'; Code=8; Pattern='total: 0'},
+        @{Name='compilation failure'; Source='using Xunit; public class T { [Fact] public void Fail() { MissingMethod(); } }'; Code=1; Pattern='CS0103'},
+        @{Name='restore failure'; Source='using Xunit; public class T { [Fact] public void Pass() {} }'; Code=1; Pattern='NU1101'; Pins=@('Csrun.Nonexistent.Acceptance.Package@1.0.0')}
+    )
+    foreach ($case in $normalCases) {
+        Test-Case "normal servers: $($case.Name) preserves exit status and cleans artifacts" {
+            $m = New-Manifest $case.Source test
+            $m.framework = $executionFramework
+            if ($case.ContainsKey('Pins')) { $m.dependsOn = $case.Pins }
+            $result = Invoke-Runner @{ManifestJson=($m | ConvertTo-Json)} -NormalBuildServers
+            Assert-Result $result $case.Code $case.Pattern
+            Assert-TestArtifactsRemoved $result
+        }
+    }
+    if (-not $CompatibilityOnly) {
     Test-Case 'inline console and no user project' {
+        $projectsBefore = @(Get-ChildItem $root -Recurse -Filter *.csproj | Select-Object -ExpandProperty FullName | Sort-Object)
         Assert-Result (Invoke-Manifest (New-Manifest)) 0 '(?m)^hello\r?$'
-        if (@(Get-ChildItem $root -Recurse -Filter *.csproj).Count) { throw 'Console created a user project.' }
+        $projectsAfter = @(Get-ChildItem $root -Recurse -Filter *.csproj | Select-Object -ExpandProperty FullName | Sort-Object)
+        if (($projectsBefore -join "`n") -cne ($projectsAfter -join "`n")) { throw 'Console created a user project.' }
     }
     Test-Case 'exact DateSpan example and output' {
         $manifest = Get-Content "$PSScriptRoot/../samples/datespan.json" -Raw | ConvertFrom-Json -AsHashtable
@@ -121,7 +187,7 @@ try {
             if (Test-Path -LiteralPath $Matches.path) { throw 'ANSI run leaked test artifacts.' }
         } finally { $script:runner = $originalRunner }
     }
-    Test-Case 'isolated builds leave no compiler server analyzer cache' {
+    Test-Case 'isolated harness does not create compiler server caches' {
         # Force a unique pipe so an already-running local compiler cannot mask
         # the fresh-runner behavior seen in CI. Shared compilation stays disabled.
         Assert-Result (Invoke-Runner @{Source='System.Console.WriteLine("isolated-build");'} -Environment @{SharedCompilationId=('csrun-regression-' + [guid]::NewGuid().ToString('N'))}) 0 'isolated-build'
@@ -319,6 +385,7 @@ public class Tests {
         $path = $Matches.path.Trim() -replace '^.* - ', ''
         if (Test-Path -LiteralPath $path) { throw "Leaked artifacts: $path" }
         if (@(Get-ChildItem -LiteralPath $root -Directory -Filter 'csrun-*').Count) { throw 'Leaked test artifacts from an earlier success or failure.' }
+    }
     }
 } finally {
     $resolvedRoot = [IO.Path]::GetFullPath($root)
