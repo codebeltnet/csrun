@@ -32,6 +32,7 @@ if ($data.clipboardText) { function Get-Clipboard { param([switch] $Raw) $data.c
 if ($data.clipboardFailure) { function Get-Clipboard { param([switch] $Raw) throw 'Clipboard unavailable in this test host.' } }
 if ($data.scriptblock) {
     & ([scriptblock]::Create([IO.File]::ReadAllText($data.path))) @parameters
+    Write-Host "SESSION_ALIVE:$LASTEXITCODE"
 } else {
     & $data.path @parameters
 }
@@ -113,6 +114,100 @@ try {
         } finally { Pop-Location }
     }
     $executionFramework = if ($CompatibilityOnly) { 'net10.0' } else { 'net11.0' }
+    $runnerText = [IO.File]::ReadAllText($runner)
+    $tokens = $null; $parseErrors = $null
+    $ast = [System.Management.Automation.Language.Parser]::ParseInput($runnerText, [ref]$tokens, [ref]$parseErrors)
+    $policyAst = $ast.Find({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Resolve-Framework' }, $true)
+    . ([scriptblock]::Create($policyAst.Extent.Text))
+    $fixture = (Get-Content "$PSScriptRoot/fixtures/releases-index.json" -Raw | ConvertFrom-Json -AsHashtable)['releases-index']
+    Test-Case 'lifecycle fixture selects LTS and validates explicit channels' {
+        if ((Resolve-Framework $null $fixture) -cne 'net10.0') { throw 'Wrong LTS default.' }
+        foreach ($tfm in @('net10.0', 'net11.0', 'net11.0-windows10.0.19041.0', 'net13.0')) {
+            if ((Resolve-Framework $tfm $fixture) -cne $tfm) { throw "Changed explicit TFM $tfm" }
+        }
+        foreach ($tfm in @('net9.0','net12.0','net99.0','win-x64')) {
+            $rejected = $false
+            try { $null = Resolve-Framework $tfm $fixture } catch { $rejected = $true }
+            if (-not $rejected) { throw "Accepted $tfm" }
+        }
+        $goLive = @($fixture | ForEach-Object { $_.Clone() })
+        ($goLive | Where-Object { $_['channel-version'] -eq '13.0' })['support-phase'] = 'go-live'
+        if ((Resolve-Framework 'net13.0' $goLive) -cne 'net13.0') { throw 'Latest go-live channel was not accepted.' }
+    }
+    Test-Case 'future GA LTS and STS are selected by metadata' {
+        $future = @($fixture | ForEach-Object { $_.Clone() })
+        foreach ($channel in $future) { if ($channel['channel-version'] -in @('12.0','13.0')) { $channel['support-phase'] = 'active'; $channel['latest-release'] = "$($channel['channel-version']).0" } }
+        if ((Resolve-Framework $null $future) -cne 'net12.0') { throw 'Future LTS was not selected.' }
+        if ((Resolve-Framework 'net13.0' $future) -cne 'net13.0') { throw 'Future STS was not accepted.' }
+    }
+    Test-Case 'release cache requires valid recent metadata when offline' {
+        $indexAst = $ast.Find({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Get-ReleaseIndex' }, $true)
+        $cacheRoot = Join-Path $root 'policy-cache'; $null = New-Item -ItemType Directory $cacheRoot
+        $functionText = $indexAst.Extent.Text.Replace('[IO.Path]::GetTempPath()', "'$($cacheRoot.Replace("'", "''"))'")
+        . ([scriptblock]::Create($functionText))
+        function Invoke-WebRequest { throw 'Simulated offline' }
+        $cacheFile = Join-Path $cacheRoot 'csrun-dotnet-releases-index.json'
+        Copy-Item "$PSScriptRoot/fixtures/releases-index.json" $cacheFile
+        if ((Resolve-Framework $null (Get-ReleaseIndex)) -cne 'net10.0') { throw 'Recent cache not used.' }
+        '{}' | Set-Content $cacheFile
+        $rejected = $false
+        try { $null = Get-ReleaseIndex } catch { $rejected = $true }
+        if (-not $rejected) { throw 'Invalid cache was accepted offline.' }
+        Copy-Item "$PSScriptRoot/fixtures/releases-index.json" $cacheFile -Force
+        (Get-Item $cacheFile).LastWriteTimeUtc = [DateTime]::UtcNow.AddHours(-13)
+        $rejected = $false
+        try { $null = Get-ReleaseIndex } catch { $rejected = $true }
+        if (-not $rejected) { throw 'Expired cache was accepted offline.' }
+    }
+    Test-Case 'both modes use fixture LTS default without fallback' {
+        $indexAst = $ast.Find({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Get-ReleaseIndex' }, $true)
+        $fixtureRunner = Join-Path $root 'fixture-runner.ps1'
+        $fixturePath = (Join-Path $PSScriptRoot 'fixtures/releases-index.json').Replace("'", "''")
+        $replacement = "function Get-ReleaseIndex { return ,((Get-Content '$fixturePath' -Raw | ConvertFrom-Json -AsHashtable)['releases-index']) }"
+        $text = $runnerText.Substring(0, $indexAst.Extent.StartOffset) + $replacement + $runnerText.Substring($indexAst.Extent.EndOffset)
+        [IO.File]::WriteAllText($fixtureRunner, $text)
+        $oldRunner = $script:runner
+        try {
+            $script:runner = $fixtureRunner
+            foreach ($mode in @('console','test')) {
+                $source = if ($mode -eq 'console') { 'System.Console.WriteLine("fixture-default");' } else { 'using Xunit; public class T { [Fact] public void Pass() {} }' }
+                $result = Invoke-Runner @{ManifestJson=(@{schemaVersion=1;mode=$mode;source=$source} | ConvertTo-Json -Compress)}
+                Assert-Result $result 0 'csrun: (console|test) \| net10\.0'
+            }
+            Assert-Result (Invoke-Runner @{ManifestJson=(Get-Content "$PSScriptRoot/../samples/default-lts.json" -Raw)}) 0 'Hello from the current LTS!'
+            $futureFixture = @{ 'releases-index' = @($fixture) + @(@{ 'channel-version'='50.0'; product='.NET'; 'release-type'='lts'; 'support-phase'='active'; 'latest-release'='50.0.0' }) }
+            $futurePath = Join-Path $root 'future-releases.json'
+            $futureFixture | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $futurePath -Encoding utf8
+            $futureRunner = $text.Replace($fixturePath, $futurePath.Replace("'", "''"))
+            [IO.File]::WriteAllText($fixtureRunner, $futureRunner)
+            Assert-Result (Invoke-Runner @{Source='System.Console.WriteLine(1);'}) 1 'Selected SDK .* cannot build net50\.0'
+            $missingRuntimeRunner = $text.Replace('$runtimes = @(& $dotnet.Source --list-runtimes)', '$runtimes = @()')
+            [IO.File]::WriteAllText($fixtureRunner, $missingRuntimeRunner)
+            Assert-Result (Invoke-Runner @{Source='System.Console.WriteLine(1);'}) 1 'Missing Microsoft.NETCore.App runtime for .NET 10\.0'
+        } finally { $script:runner = $oldRunner }
+    }
+    Test-Case 'scriptblock leaves session alive after success' {
+        Assert-Result (Invoke-Runner @{Framework=$executionFramework; Source='System.Console.WriteLine(42);'} -ScriptBlock) 0 'SESSION_ALIVE:0'
+    }
+    Test-Case 'scriptblock leaves session alive after failure' {
+        Assert-Result (Invoke-Runner @{Framework=$executionFramework; Source='this is not C#;'} -ScriptBlock) 1 'SESSION_ALIVE:1'
+    }
+    Test-Case 'scriptblock preserves MTP assertion exit status' {
+        $m = New-Manifest 'using Xunit; public class T { [Fact] public void Fail() { Assert.True(false); } }' test
+        $m.framework = $executionFramework
+        Assert-Result (Invoke-Manifest $m -ScriptBlock) 2 'SESSION_ALIVE:2'
+    }
+    Test-Case 'native file invocation propagates exit status' {
+        Push-Location $root
+        try {
+            $output = & $pwsh -NoProfile -File $runner -Framework $executionFramework -Source 'System.Console.WriteLine(42);' 2>&1
+            if ($LASTEXITCODE -ne 0 -or "$output" -notmatch '42') { throw "Expected successful process, got $LASTEXITCODE`: $output" }
+            $output = & $pwsh -NoProfile -File $runner -Framework $executionFramework -Source 'this is not C#;' 2>&1
+            if ($LASTEXITCODE -ne 1) { throw "Expected failed process, got $LASTEXITCODE`: $output" }
+            $output = & $pwsh -NoProfile -File $runner -Framework $executionFramework -Mode test -Source 'using Xunit; public class T { [Fact] public void Fail() { Assert.True(false); } }' 2>&1
+            if ($LASTEXITCODE -ne 2) { throw "Expected MTP exit 2, got $LASTEXITCODE`: $output" }
+        } finally { Pop-Location }
+    }
     $runtimeMajor = if ($CompatibilityOnly) { 10 } else { 11 }
     Test-Case 'normal servers: stdin console executes on the requested runtime' {
         $source = 'System.Console.WriteLine("runtime:" + System.Environment.Version.Major);'
@@ -331,8 +426,8 @@ public class Tests {
         @{Name='noninteger schema'; Field='schemaVersion'; Value=1.0; Pattern='schemaVersion'},
         @{Name='method mode'; Field='mode'; Value='method'; Pattern='Unsupported mode'},
         @{Name='bad TFM'; Field='framework'; Value='win-x64'; Pattern='Invalid framework'},
-        @{Name='unsupported .NET 8 target'; Field='framework'; Value='net8.0'; Pattern='Invalid framework'},
-        @{Name='unsupported .NET 9 target'; Field='framework'; Value='net9.0'; Pattern='Invalid framework'},
+        @{Name='unsupported .NET 8 target'; Field='framework'; Value='net8.0'; Pattern='official .NET release index'},
+        @{Name='unsupported .NET 9 target'; Field='framework'; Value='net9.0'; Pattern='official .NET release index'},
         @{Name='MSBuild injection'; Field='framework'; Value='net11.0;Bad=1'; Pattern='Invalid framework'},
         @{Name='empty source'; Field='source'; Value=' '; Pattern='source'},
         @{Name='nonstring source'; Field='source'; Value=42; Pattern='source'},
@@ -349,7 +444,7 @@ public class Tests {
     foreach ($case in $invalidCases) {
         Test-Case $case.Name { $m=New-Manifest; $m[$case.Field]=$case.Value; Assert-Result (Invoke-Manifest $m) 1 $case.Pattern }
     }
-    foreach ($field in @('schemaVersion','mode','framework','source')) {
+    foreach ($field in @('schemaVersion','mode','source')) {
         Test-Case "missing $field" { $m=New-Manifest; $m.Remove($field); Assert-Result (Invoke-Manifest $m) 1 "Missing required manifest field '$field'" }
     }
     Test-Case 'malformed JSON' { Assert-Result (Invoke-Runner @{ManifestJson='{oops'}) 1 'Invalid manifest JSON' }
@@ -375,7 +470,7 @@ public class Tests {
         Assert-Result (Invoke-Runner @{Source='System.Console.WriteLine(1);'} -WorkingDirectory $dir) 1 'global.json'
     }
     Test-Case 'unavailable TFM is never retargeted' {
-        Assert-Result (Invoke-Runner @{Framework='net99.0'; Source='System.Console.WriteLine(1);'}) 1 'NETSDK1045'
+        Assert-Result (Invoke-Runner @{Framework='net99.0'; Source='System.Console.WriteLine(1);'}) 1 'official .NET release index'
     }
     Test-Case 'all test artifact directories removed after success and failure' {
         # Each test summary reveals the unique project path; runner must clean it.

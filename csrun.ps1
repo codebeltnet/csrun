@@ -6,14 +6,18 @@ Runs a complete trusted C# console program or genuine xUnit v3 tests.
 .DESCRIPTION
 Accepts a schemaVersion 1 JSON manifest, or direct options normalized to the
 same manifest. Requires an installed .NET 10+ SDK and the requested runtime.
+The framework defaults to the latest supported GA LTS channel. Explicit targets
+are checked against the official release index, cached for up to 12 hours.
+Scriptblock callers can inspect $LASTEXITCODE without leaving their session;
+pwsh -File returns that status to the calling process.
 Executes code and package build assets with your permissions; this is not a sandbox.
 .PARAMETER ManifestJson
-Canonical JSON manifest with schemaVersion, mode, framework, source and optional
-dependsOn, sdk and frameworkReferences fields. Exclusive with direct options.
+Canonical JSON manifest with schemaVersion, mode, source and optional
+framework, dependsOn, sdk and frameworkReferences fields. Exclusive with direct options.
 .PARAMETER Mode
 console (default) or test.
 .PARAMETER Framework
-Target framework; defaults to net11.0 for direct use.
+Target framework; defaults to the latest supported LTS channel.
 .PARAMETER DependsOn
 Explicit PackageId@ExactVersion pins. No floating versions or discovery.
 .PARAMETER Source
@@ -35,7 +39,7 @@ Read complete source from the clipboard. Also the default if no source is given.
 param(
     [string] $ManifestJson,
     [string] $Mode = 'console',
-    [string] $Framework = 'net11.0',
+    [string] $Framework,
     [string[]] $DependsOn = @(),
     [string] $Source,
     [string] $File,
@@ -61,22 +65,64 @@ function Get-PackagePins($Specs) {
     return ,$pins
 }
 
+function Get-ReleaseIndex {
+    $cache = Join-Path ([IO.Path]::GetTempPath()) 'csrun-dotnet-releases-index.json'
+    $json = $null
+    if ((Test-Path -LiteralPath $cache) -and (Get-Item -LiteralPath $cache).LastWriteTimeUtc -gt [DateTime]::UtcNow.AddHours(-12) -and (Get-Item -LiteralPath $cache).LastWriteTimeUtc -le [DateTime]::UtcNow) {
+        try {
+            $json = Get-Content -LiteralPath $cache -Raw
+            $cachedIndex = ConvertFrom-Json -InputObject $json -AsHashtable -ErrorAction Stop
+            if ($cachedIndex -isnot [System.Collections.IDictionary] -or $cachedIndex['releases-index'] -isnot [array] -or $cachedIndex['releases-index'].Count -eq 0) { $json = $null }
+        } catch { $json = $null }
+    }
+    if (-not $json) {
+        try {
+            $json = (Invoke-WebRequest -Uri 'https://raw.githubusercontent.com/dotnet/core/main/release-notes/releases-index.json' -TimeoutSec 20 -ErrorAction Stop).Content
+            $downloadedIndex = ConvertFrom-Json -InputObject $json -AsHashtable -ErrorAction Stop
+            if ($downloadedIndex -isnot [System.Collections.IDictionary] -or $downloadedIndex['releases-index'] -isnot [array] -or $downloadedIndex['releases-index'].Count -eq 0) { throw 'Invalid release index.' }
+            try { [IO.File]::WriteAllText($cache, $json) } catch { }
+        } catch { throw "Unable to obtain the official .NET release index and no valid recent cache is available: $($_.Exception.Message)" }
+    }
+    $index = ConvertFrom-Json -InputObject $json -AsHashtable
+    if (-not $index.Contains('releases-index') -or $index['releases-index'] -isnot [array] -or $index['releases-index'].Count -eq 0) { throw 'Invalid .NET release index; cannot validate the framework.' }
+    return ,$index['releases-index']
+}
+
+function Resolve-Framework($Framework, $Index) {
+    $channels = @($Index | Where-Object { $_.product -eq '.NET' -and $_['channel-version'] -match '^\d+\.\d+$' -and [version]$_['channel-version'] -ge [version]'10.0' } | Sort-Object { [version]$_['channel-version'] } -Descending)
+    if ($null -eq $Framework) {
+        $lts = @($channels | Where-Object { $_['release-type'] -eq 'lts' -and $_['support-phase'] -in @('active', 'maintenance') -and $_['latest-release'] -match '^\d+\.\d+\.\d+$' }) | Select-Object -First 1
+        if (-not $lts) { throw 'The release index contains no supported GA LTS channel.' }
+        return Resolve-Framework "net$($lts['channel-version'])" $Index
+    }
+    if ($Framework -isnot [string] -or $Framework -cnotmatch '^net(?<channel>[1-9][0-9]*\.[0-9]+)(?:-(?:windows|linux|macos|android|ios|maccatalyst|tvos|browser)(?:[0-9]+(?:\.[0-9]+){0,3})?)?$') { throw 'Invalid framework; supply a .NET target framework such as net10.0 or net10.0-windows.' }
+    $channel = $Matches.channel
+    $entry = @($channels | Where-Object { $_['channel-version'] -ceq $channel })
+    if ($entry.Count -ne 1) { throw "Framework '$Framework' has no unique channel in the official .NET release index." }
+    $entry = $entry[0]
+    if ($entry['release-type'] -notin @('lts','sts')) { throw "Framework '$Framework' has an unrecognized release type." }
+    if ($entry['support-phase'] -in @('active','maintenance') -and $entry['latest-release'] -match '^\d+\.\d+\.\d+$') { return $Framework }
+    if ($entry['support-phase'] -in @('preview','go-live')) {
+        $latestPreview = @($channels | Where-Object { $_['support-phase'] -in @('preview','go-live') -and $_['release-type'] -in @('lts','sts') } | Select-Object -First 1)
+        if ($latestPreview.Count -eq 1 -and $latestPreview[0]['channel-version'] -ceq $channel) { return $Framework }
+    }
+    throw "Framework '$Framework' is not a supported GA channel or the latest preview/go-live channel."
+}
+
 function Get-ValidatedManifest($InputManifest) {
     if ($InputManifest -isnot [System.Collections.IDictionary]) { throw 'Manifest must be a JSON object.' }
     $allowed = @('schemaVersion', 'mode', 'framework', 'source', 'dependsOn', 'sdk', 'frameworkReferences')
     foreach ($key in $InputManifest.Keys) {
         if ($key -cnotin $allowed) { throw "Unknown manifest field '$key'." }
     }
-    foreach ($key in @('schemaVersion', 'mode', 'framework', 'source')) {
+    foreach ($key in @('schemaVersion', 'mode', 'source')) {
         if (-not $InputManifest.Contains($key)) { throw "Missing required manifest field '$key'." }
     }
     if (($InputManifest.schemaVersion -isnot [long] -and $InputManifest.schemaVersion -isnot [int]) -or $InputManifest.schemaVersion -ne 1) {
         throw 'Unsupported schemaVersion; expected integer 1.'
     }
     if ($InputManifest.mode -isnot [string] -or $InputManifest.mode -notin @('console', 'test')) { throw 'Unsupported mode; use console or test.' }
-    if ($InputManifest.framework -isnot [string] -or $InputManifest.framework -cnotmatch '^net(?<major>[1-9][0-9]+)\.0(?:-(?:windows(?:[0-9]+(?:\.[0-9]+){0,3})?|linux|macos(?:[0-9]+(?:\.[0-9]+){0,2})?))?$') {
-        throw 'Invalid framework; use a .NET 10+ target framework such as net11.0, not a runtime identifier such as win-x64.'
-    }
+    $framework = if ($InputManifest.Contains('framework')) { $InputManifest.framework; if ($null -eq $InputManifest.framework) { throw 'Invalid framework; omit the field to select the LTS default.' } } else { $null }
     if ($InputManifest.source -isnot [string] -or [string]::IsNullOrWhiteSpace($InputManifest.source)) { throw 'source must be a nonempty complete C# program or test source.' }
     $sdk = 'Microsoft.NET.Sdk'
     if ($InputManifest.Contains('sdk')) {
@@ -111,7 +157,7 @@ function Get-ValidatedManifest($InputManifest) {
     } elseif ($refs.Count -gt 0 -and ($sdk -cne 'Microsoft.NET.Sdk.Web' -or @($refs | Where-Object { $_ -cne 'Microsoft.AspNetCore.App' }).Count -gt 0)) {
         throw 'Console frameworkReferences require sdk Microsoft.NET.Sdk.Web and Microsoft.AspNetCore.App; use test mode for other explicit framework references.'
     }
-    return @{ Mode = $executionMode; Framework = $InputManifest.framework; Source = $InputManifest.source; Sdk = $sdk; Pins = $pins; References = $refs }
+    return @{ Mode = $executionMode; Framework = $framework; Source = $InputManifest.source; Sdk = $sdk; Pins = $pins; References = $refs }
 }
 
 function Get-ConsoleSource($Manifest) {
@@ -204,15 +250,32 @@ try {
             try { $Source = Get-Clipboard -Raw -ErrorAction Stop }
             catch { throw 'Clipboard unavailable; supply Source or File.' }
         }
-        $inputManifest = @{ schemaVersion = 1; mode = $Mode; framework = $Framework; dependsOn = $DependsOn; source = $Source }
+        $inputManifest = @{ schemaVersion = 1; mode = $Mode; dependsOn = $DependsOn; source = $Source }
+        if ($PSBoundParameters.ContainsKey('Framework')) { $inputManifest.framework = $Framework }
     }
     $manifest = Get-ValidatedManifest $inputManifest
+    $releaseIndex = Get-ReleaseIndex
+    $manifest.Framework = Resolve-Framework $manifest.Framework $releaseIndex
     $consoleSource = $null
     if ($manifest.Mode -eq 'console') { $consoleSource = Get-ConsoleSource $manifest }
     $dotnet = Get-Command dotnet -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
     if ($null -eq $dotnet) { throw 'Missing .NET SDK; install a compatible .NET 10+ SDK and the requested runtime.' }
     $sdkVersion = & $dotnet.Source --version
     if ($LASTEXITCODE -ne 0 -or $sdkVersion -notmatch '^(\d+)\.' -or [int]$Matches[1] -lt 10) { throw 'No compatible .NET 10+ SDK selected. Check installed SDKs and the current directory global.json.' }
+    $null = $manifest.Framework -match '^net(?<channel>\d+\.\d+)'
+    $targetChannel = [version]$Matches.channel
+    $targetRelease = @($releaseIndex | Where-Object { $_.product -eq '.NET' -and $_['channel-version'] -eq $targetChannel.ToString() })[0]
+    $selectedVersion = [version](($sdkVersion -split '-')[0])
+    if ($selectedVersion.Major -lt $targetChannel.Major -or ($selectedVersion.Major -eq $targetChannel.Major -and $selectedVersion.Minor -lt $targetChannel.Minor)) { throw "Selected SDK $sdkVersion cannot build $($manifest.Framework); select a compatible SDK using global.json or install one." }
+    $runtimes = @(& $dotnet.Source --list-runtimes)
+    if ($LASTEXITCODE -ne 0) { throw 'Unable to list installed .NET runtimes.' }
+    $requiredRuntimes = @('Microsoft.NETCore.App')
+    if ($manifest.Sdk -eq 'Microsoft.NET.Sdk.Web' -or 'Microsoft.AspNetCore.App' -in $manifest.References) { $requiredRuntimes += 'Microsoft.AspNetCore.App' }
+    if (@($manifest.References | Where-Object { $_ -match '^Microsoft\.WindowsDesktop\.App(?:\.|$)' }).Count) { $requiredRuntimes += 'Microsoft.WindowsDesktop.App' }
+    $prereleasePattern = if ($targetRelease['support-phase'] -in @('preview', 'go-live')) { '(?:-[^ ]+)?' } else { '' }
+    foreach ($runtime in $requiredRuntimes) {
+        if (-not @($runtimes | Where-Object { $_ -match "^$([regex]::Escape($runtime)) $([regex]::Escape($targetChannel.ToString()))\.\d+$prereleasePattern " }).Count) { throw "Missing $runtime runtime for .NET $targetChannel required by $($manifest.Framework); install the runtime before running csrun." }
+    }
     $dependencies = @($manifest.Pins.Keys | ForEach-Object { "$_@$($manifest.Pins[$_])" })
     Write-Host "csrun: $($manifest.Mode) | $($manifest.Framework) | dependencies: $($dependencies -join ', ')"
     if ($manifest.Mode -eq 'console') {
@@ -250,4 +313,5 @@ try {
         catch { [Console]::Error.WriteLine("csrun: could not clean temporary artifacts '$temporaryDirectory': $($_.Exception.Message)"); if ($exitCode -eq 0) { $exitCode = 1 } }
     }
 }
-exit $exitCode
+$global:LASTEXITCODE = $exitCode
+if ($MyInvocation.MyCommand.Path) { exit $exitCode }
