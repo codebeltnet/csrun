@@ -219,6 +219,8 @@ public class Tests {
         @{Name='noninteger schema'; Field='schemaVersion'; Value=1.0; Pattern='schemaVersion'},
         @{Name='method mode'; Field='mode'; Value='method'; Pattern='Unsupported mode'},
         @{Name='bad TFM'; Field='framework'; Value='win-x64'; Pattern='Invalid framework'},
+        @{Name='unsupported .NET 8 target'; Field='framework'; Value='net8.0'; Pattern='Invalid framework'},
+        @{Name='unsupported .NET 9 target'; Field='framework'; Value='net9.0'; Pattern='Invalid framework'},
         @{Name='MSBuild injection'; Field='framework'; Value='net11.0;Bad=1'; Pattern='Invalid framework'},
         @{Name='empty source'; Field='source'; Value=' '; Pattern='source'},
         @{Name='nonstring source'; Field='source'; Value=42; Pattern='source'},

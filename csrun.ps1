@@ -74,8 +74,8 @@ function Get-ValidatedManifest($InputManifest) {
         throw 'Unsupported schemaVersion; expected integer 1.'
     }
     if ($InputManifest.mode -isnot [string] -or $InputManifest.mode -notin @('console', 'test')) { throw 'Unsupported mode; use console or test.' }
-    if ($InputManifest.framework -isnot [string] -or $InputManifest.framework -cnotmatch '^net(?<major>[5-9]|[1-9][0-9]+)\.0(?:-(?:windows(?:[0-9]+(?:\.[0-9]+){0,3})?|linux|macos(?:[0-9]+(?:\.[0-9]+){0,2})?))?$') {
-        throw 'Invalid framework; use a target framework such as net11.0, not a runtime identifier such as win-x64.'
+    if ($InputManifest.framework -isnot [string] -or $InputManifest.framework -cnotmatch '^net(?<major>[1-9][0-9]+)\.0(?:-(?:windows(?:[0-9]+(?:\.[0-9]+){0,3})?|linux|macos(?:[0-9]+(?:\.[0-9]+){0,2})?))?$') {
+        throw 'Invalid framework; use a .NET 10+ target framework such as net11.0, not a runtime identifier such as win-x64.'
     }
     if ($InputManifest.source -isnot [string] -or [string]::IsNullOrWhiteSpace($InputManifest.source)) { throw 'source must be a nonempty complete C# program or test source.' }
     $sdk = 'Microsoft.NET.Sdk'

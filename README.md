@@ -57,7 +57,7 @@ Direct options default to `console`, `net11.0`, and no packages. Source defaults
 | --- | --- |
 | `schemaVersion` | Required integer `1`. |
 | `mode` | Required `console` or `test`, case-insensitive. |
-| `framework` | Required modern .NET TFM such as `net11.0` or `net11.0-windows`; an RID such as `win-x64` is invalid. Platform availability is checked by the SDK. |
+| `framework` | Required .NET 10+ TFM such as `net11.0` or `net11.0-windows`; earlier targets and RIDs such as `win-x64` are invalid. Platform availability is checked by the SDK. |
 | `source` | Required nonempty string containing a complete program or test source. Multiline text, quotes, Unicode, and line endings are preserved. |
 | `dependsOn` | Optional array of `PackageId@ExactVersion` pins, including prereleases. Identical duplicates collapse; conflicting versions, ranges, wildcards, and unversioned packages fail. Use three or four numeric version components. |
 | `sdk` | Optional `Microsoft.NET.Sdk` (default) or `Microsoft.NET.Sdk.Web`. Never inferred. |
