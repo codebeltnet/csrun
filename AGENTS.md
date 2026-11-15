@@ -14,4 +14,4 @@
 - Allowed release channels are supported LTS and STS releases, plus preview and go-live releases on .NET 10 or later. Exclude end-of-life channels.
 - Verify support status and version choices against Microsoft's authoritative [release index](https://raw.githubusercontent.com/dotnet/core/main/release-notes/releases-index.json), following its per-channel metadata when needed. Do not infer support status from the major version alone.
 - Keep selected SDKs and direct NuGet dependencies pinned. Do not silently upgrade packages, retarget examples, or install SDKs at runner execution time.
-- A dependency's compatible `lib/net8.0` asset can run on .NET 10+. Its asset TFM alone does not mean the .NET 8 runtime is used or that the package is unsupported. Assess package maintenance, advisories, and compatibility separately.
+- An omitted framework selects the highest supported GA LTS channel; explicit frameworks are validated against the release index and never silently substituted. The latest preview or go-live channel is allowed only when explicitly requested.
