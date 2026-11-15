@@ -6,13 +6,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [0.2.0] - 2026-11-15
 
-This minor release adds optional disposable Ubuntu container execution while preserving the standalone native PowerShell engine and manifest schema version 1.
+This minor release adds optional disposable Ubuntu container execution and SDK environment publishing, while the standalone native PowerShell engine (`csrun.ps1`) and manifest schema version 1 remain unchanged.
 
 ### Added
 
-- Added `csrun.Dockerfile` and a UTF-8 stdin adapter for console samples and genuine xUnit v3 tests, with non-root execution and read-only root filesystem support,
-- Added a self-contained `BuildAndPublish` module with explicit single/combined SDK environments, existing SDK tag conventions, verified latest-release engine assets, image identity metadata, and Buildx SBOM/provenance publication options,
-- Added Docker integration tests and Ubuntu AMD64/ARM64 CI validation alongside the existing native Windows tests, plus container usage, isolation, image caching and deliberate publication documentation.
+- Added `csrun.Dockerfile` and a UTF-8 stdin entry point, so a manifest piped to `docker run --rm -i` runs the bundled engine inside a Linux container with the selected .NET SDKs preinstalled, for console samples and xUnit v3 tests,
+- Added the `BuildAndPublish` module, which resolves exact .NET SDK versions to environment tags, builds the container image, writes an OCI archive with image identity metadata, and publishes only when explicitly requested,
+- Added Docker integration tests in `tests/container.Tests.ps1` that cover SDK inventories, stdin execution, exit codes, and hardened read-only execution, plus Ubuntu AMD64 and ARM64 container validation in CI,
+- Added README and `docs/container-validation.md` documentation for container usage, isolation limits, and SDK environment publishing.
+
+### Changed
+
+- Changed the release workflow to attach the tested OCI image archives and a `csrun.ps1.sha256` checksum to the draft GitHub release,
+- Changed the pull request workflow to add a required quality gate that fails unless the Windows and container jobs succeed, and to pin Windows jobs to `windows-2025`.
 
 ## [0.1.0] - 2026-11-15
 
