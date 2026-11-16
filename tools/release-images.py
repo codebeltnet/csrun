@@ -7,6 +7,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import urllib.request
 from types import SimpleNamespace
 import oci
@@ -24,15 +25,29 @@ def identity(meta):
     return SimpleNamespace(version=meta['EngineVersion'], revision=meta['SourceCommit'], engine=meta['EngineSha256'], sdks=meta['SdkVersions'])
 
 
+def validate_tags(meta):
+    # The PowerShell planner is the sole source of alias names, including in CD.
+    command = "Import-Module $env:CSRUN_MODULE -Force; BuildAndPublish -SdkVersion ($env:SDK_VERSIONS.Split(',')) -EngineVersion $env:ENGINE_VERSION -WhatIf -PassThru | ConvertTo-Json -Compress"
+    output = subprocess.check_output(['pwsh', '-NoProfile', '-Command', command], env={**os.environ, 'SDK_VERSIONS': ','.join(meta['SdkVersions']), 'ENGINE_VERSION': meta['EngineVersion'], 'CSRUN_MODULE': str(Path(__file__).resolve().parent.parent / 'BuildAndPublish.psm1')}, text=True)
+    plan = json.loads(output.strip().splitlines()[-1])
+    if 'ConvenienceTags' not in meta and 'VersionedTags' not in meta:
+        # Historical records retain their original convenience-only contract.
+        # Recovery must never synthesize release aliases for older artifacts.
+        oci.require(plan['ConvenienceTags'] == meta['Tags'], 'Publishing aliases differ from historical version contract')
+    else:
+        oci.require(all(plan[k] == meta[k] for k in ('Tags', 'ConvenienceTags', 'VersionedTags')), 'Publishing aliases differ from version contract')
+
+
 def assemble(variant):
     root = Path('inputs')
     metadata = [json.loads(p.read_text(encoding='utf-8-sig')) for p in root.glob('*/csrun-image.json')]
     oci.require(len(metadata) == 2, 'Both native verification records required')
     first = dict(metadata[0])
     for meta in metadata:
-        oci.require(meta['NativeVerified'] is True and all(meta[k] == first[k] for k in ('SdkVersions', 'EngineVersion', 'EngineSha256', 'SourceCommit', 'Tags')), 'Native verification identity mismatch')
+        oci.require(meta['NativeVerified'] is True and all(meta[k] == first[k] for k in ('SdkVersions', 'EngineVersion', 'EngineSha256', 'SourceCommit', 'Tags', 'ConvenienceTags', 'VersionedTags')), 'Native verification identity mismatch')
     oci.require({m['Platforms'][0] for m in metadata} == {'linux/amd64', 'linux/arm64'}, 'Both native CPUs required')
     oci.require(first['SourceCommit'] == os.environ['GITHUB_SHA'] and first['EngineVersion'] == os.environ['GITHUB_REF_NAME'], 'Release source mismatch')
+    validate_tags(first)
     Path('out').mkdir(exist_ok=True)
     archives = sorted(str(p) for p in root.glob('*/*.tar'))
     oci.require(len(archives) == 2, 'Exactly two native OCI inputs required')
@@ -132,12 +147,8 @@ def restore(variant, versions=None):
     records = meta['Verification']
     oci.require(len(records) == 2 and {r['Platforms'][0] for r in records} == {'linux/amd64', 'linux/arm64'}, 'Both native verifications required')
     for record in records:
-        oci.require(record['NativeVerified'] is True and all(record[k] == meta[k] for k in ('SdkVersions', 'EngineSha256', 'EngineVersion', 'SourceCommit', 'Tags')), 'Native result identity mismatch')
-    # Recompute aliases using the same module as the manual interface, without external resolution.
-    command = "Import-Module $env:CSRUN_MODULE -Force; $p = BuildAndPublish -SdkVersion ($env:SDK_VERSIONS.Split(',')) -WhatIf -PassThru; $p.Tags | ConvertTo-Json -Compress"
-    output = subprocess.check_output(['pwsh', '-NoProfile', '-Command', command], env={**os.environ, 'SDK_VERSIONS': ','.join(meta['SdkVersions']), 'CSRUN_MODULE': str(Path(__file__).resolve().parent.parent / 'BuildAndPublish.psm1')}, text=True)
-    tags = json.loads(output.strip().splitlines()[-1])
-    oci.require(tags == meta['Tags'], 'Publishing aliases differ from version contract')
+        oci.require(record['NativeVerified'] is True and all(record.get(k) == meta.get(k) for k in ('SdkVersions', 'EngineSha256', 'EngineVersion', 'SourceCommit', 'Tags', 'ConvenienceTags', 'VersionedTags')), 'Native result identity mismatch')
+    validate_tags(meta)
     with open('out/image.tar', 'wb') as archive:
         for part in meta['Pieces']:
             oci.require(re.fullmatch(r'csrun-' + re.escape(variant) + r'\.oci\.part\d{3}', part['name']), 'Invalid piece identity')
@@ -148,6 +159,8 @@ def restore(variant, versions=None):
             Path('out/part').unlink()
     oci.require(oci.checksum('out/image.tar') == meta['ArchiveSha256'], 'Reassembled archive checksum mismatch')
     oci.Archive('out/image.tar').verify(identity(meta), ['amd64', 'arm64'])
+    archive = oci.Archive('out/image.tar')
+    oci.require('sha256:' + hashlib.sha256(archive.index_bytes).hexdigest() == meta['OciIndexDigest'], 'Saved OCI index digest mismatch')
     oci.seal('out/image.tar')
     summary(meta)
 
@@ -157,22 +170,56 @@ def summary(meta):
     if path:
         with open(path, 'a') as stream:
             stream.write(f"\nSDK image {meta['SdkVersions']}: [GitHub Release {meta['EngineVersion']}](https://github.com/codebeltnet/csrun/releases/tag/{meta['EngineVersion']}) at {meta['SourceCommit']}\n\ncsrun SHA256: {meta['EngineSha256']}\n\n")
-            stream.write(f"SDK aliases: {', '.join(meta['Tags'])}\n\nVerified OCI index: {meta.get('OciIndexDigest', 'platform build')}\n\n")
+            stream.write(f"Convenience aliases: {', '.join(meta.get('ConvenienceTags', meta['Tags']))}\n\nRelease-versioned aliases: {', '.join(meta.get('VersionedTags', []))}\n\nVerified OCI index: {meta.get('OciIndexDigest', 'platform build')}\n\n")
             for item in meta.get('Verification', [meta]):
                 stream.write(f"- {item['Platforms']}: native runtime suite passed; SDK inventory {item['SdkVersions']}; image size {item['SizeBytes']} bytes\n")
                 if item.get('OciArchiveBytes'):
                     stream.write(f"  OCI archive: {item['OciArchiveBytes']} bytes (compressed layers, manifests and attestations).\n")
 
 
-def publish():
+def current_release():
     resolved = json.loads(Path('resolved/identity.json').read_text())
     latest = gh(f"repos/{os.environ['GITHUB_REPOSITORY']}/releases/latest")
     oci.require(latest['id'] == resolved['releaseId'] and latest['tag_name'] == resolved['tag'] and not latest['draft'], 'Latest release changed after verification; refusing stale SDK alias promotion')
-    meta = json.loads(Path('out/release.json').read_text())
+
+
+def publication_args(meta, archive):
     args = identity(meta)
-    args.archive = 'out/image.tar'
+    args.archive = str(archive)
     args.tags = meta['Tags']
-    oci.publish(args)
+    args.versioned_tags = meta.get('VersionedTags', [])
+    args.legacy_convenience_only = 'ConvenienceTags' not in meta and 'VersionedTags' not in meta
+    args.expected = meta['OciIndexDigest']
+    return args
+
+
+def publish():
+    current_release()
+    meta = json.loads(Path('out/release.json').read_text())
+    validate_tags(meta)
+    oci.publish(publication_args(meta, 'out/image.tar'), before_convenience=current_release)
+
+
+def publish_all():
+    """Preflight every variant, publish all stable names, then move convenience names."""
+    current_release()
+    with tempfile.TemporaryDirectory(prefix='csrun-promotion-', dir='.') as temp:
+        variants = []
+        for variant in ('10', '11', '10-11'):
+            restore(variant)
+            destination = Path(temp) / variant
+            Path('out').rename(destination)
+            meta = json.loads((destination / 'release.json').read_text())
+            variants.append(publication_args(meta, destination / 'image.tar'))
+        for args in variants:
+            oci.preflight(args)
+        for args in variants:
+            current_release()
+            if not args.legacy_convenience_only:
+                oci.publish(args, family='versioned')
+        for args in variants:
+            current_release()
+            oci.publish(args, family='convenience', before_convenience=current_release)
 
 
 if __name__ == '__main__':
@@ -180,4 +227,4 @@ if __name__ == '__main__':
     if command in ('assemble', 'split', 'restore'):
         globals()[command](sys.argv[2])
     else:
-        globals()[command]()
+        globals()[command.replace('-', '_')]()

@@ -83,6 +83,27 @@ function Invoke-CsrunDocker([string[]] $Arguments) {
     if ($LASTEXITCODE -ne 0) { throw "docker $($Arguments[0]) failed with exit $LASTEXITCODE." }
 }
 
+function Resolve-CsrunImageTags([string[]] $ConvenienceTags, [string] $EngineVersion) {
+    if ($EngineVersion -and $EngineVersion -cnotmatch '^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$') { throw 'Engine release version must use vMAJOR.MINOR.PATCH.' }
+    $versioned = @(if ($EngineVersion) { $ConvenienceTags | ForEach-Object { "$_-$EngineVersion" } })
+    $all = @($ConvenienceTags) + $versioned
+    if (@($all | Where-Object { $_.Length -gt 128 -or $_ -cnotmatch '^[A-Za-z0-9_][A-Za-z0-9_.-]*$' }).Count) { throw 'Invalid or overlong Docker tag.' }
+    if (@($all | Select-Object -Unique).Count -ne $all.Count) { throw 'Duplicate Docker tags.' }
+    [pscustomobject]@{ ConvenienceTags=@($ConvenienceTags); VersionedTags=$versioned; Tags=$all }
+}
+
+function Get-CsrunPublishedEngine([string] $Repository, [string] $Destination, [string] $EngineVersion) {
+    if ($Repository -cnotmatch '^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$') { throw 'Invalid engine repository.' }
+    $release = Invoke-RestMethod "https://api.github.com/repos/$Repository/releases/latest"
+    $asset = @($release.assets | Where-Object name -CEQ 'csrun.ps1')
+    if ($release.draft -or $release.prerelease -or $release.tag_name -cnotmatch '^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$' -or $asset.Count -ne 1 -or $asset[0].digest -cnotmatch '^sha256:[a-f0-9]{64}$') { throw 'Latest release has no verifiable csrun.ps1 asset.' }
+    if ($EngineVersion -and $EngineVersion -cne $release.tag_name) { throw 'Explicit engine version differs from the authoritative downloaded release.' }
+    Invoke-WebRequest "https://github.com/$Repository/releases/latest/download/csrun.ps1" -OutFile $Destination
+    $hash = (Get-FileHash $Destination -Algorithm SHA256).Hash.ToLowerInvariant()
+    if ("sha256:$hash" -cne $asset[0].digest -or (Get-Item $Destination).Length -ne $asset[0].size) { throw 'Latest engine asset changed or failed integrity validation.' }
+    [pscustomobject]@{ Release=$release; Hash=$hash }
+}
+
 function BuildAndPublish {
     [CmdletBinding(SupportsShouldProcess)]
     param(
@@ -137,11 +158,12 @@ function BuildAndPublish {
         if ($version.FullVersion -cnotmatch '^(?:[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$' -or [version](($version.FullVersion -split '-')[0]) -lt [version]'10.0.0') { throw 'Supply exact .NET 10+ SDK versions.' }
     }
     $tags = @($publishTags, $majorMinorTags, $majorTags)
-    if (@($tags | Where-Object { $_.Length -gt 128 -or $_ -cnotmatch '^[A-Za-z0-9_][A-Za-z0-9_.-]*$' }).Count) { throw 'Invalid or overlong Docker tag.' }
+    $tagPlan = Resolve-CsrunImageTags $tags $EngineVersion
     if ($BuildOnly -and $Platform.Count -ne 1) { throw 'BuildOnly loads one architecture at a time; test each explicitly.' }
     $image = '{0}/{1}' -f $Repository.TrimEnd('/'), $ImageName
     if (@($Platform | Select-Object -Unique).Count -ne $Platform.Count) { throw 'Supply each target platform only once.' }
-    if ($EnginePath -and $EngineVersion -cnotmatch '^v\d+\.\d+\.\d+$') { throw 'Local engines require an explicit release version.' }
+    if ($EnginePath -and -not $EngineVersion) { throw 'Local engines require an explicit release version.' }
+    if ($PSBoundParameters.ContainsKey('EngineVersion') -and -not $EngineVersion) { throw 'Engine release version must not be empty.' }
     if (-not $BuildOnly -and $image -ceq 'docker.io/codebeltnet/csrun') {
         if ($Platform.Count -ne 2) { throw 'Codebelt production requires both native AMD64 and ARM64 verification.' }
         if ($EnginePath -or $EngineRepository -cne 'codebeltnet/csrun' -or $SourceRepository -cne 'https://github.com/codebeltnet/csrun') { throw 'Codebelt production images require the canonical source and verified latest published engine.' }
@@ -157,11 +179,14 @@ function BuildAndPublish {
         MajorMinorTags = $majorMinorTags
         PublishTags    = $publishTags
         BuildArgs      = @()
-        Tags           = @($tags | ForEach-Object { "${image}:$_" })
+        Tags           = @($tagPlan.Tags | ForEach-Object { "${image}:$_" })
+        ConvenienceTags = @($tagPlan.ConvenienceTags | ForEach-Object { "${image}:$_" })
+        VersionedTags  = @($tagPlan.VersionedTags | ForEach-Object { "${image}:$_" })
+        UnresolvedVersionedTags = @(if (-not $EngineVersion) { $tags | ForEach-Object { "${image}:$_-<verified-release-version>" } })
         Platforms      = $Platform
         DockerContexts = $DockerContext
         Builders       = $Builder
-        EngineVersion  = $null
+        EngineVersion  = $EngineVersion
         EngineSha256   = $null
         BaseImage      = $null
         MetadataFile   = [IO.Path]::GetFullPath($MetadataFile)
@@ -216,18 +241,18 @@ function BuildAndPublish {
                 $hash = (Get-FileHash $engine -Algorithm SHA256).Hash.ToLowerInvariant()
             } else {
                 # Resolve the moving reference once for all requested platforms.
-                if ($EngineRepository -cnotmatch '^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$') { throw 'Invalid engine repository.' }
-                $release = Invoke-RestMethod "https://api.github.com/repos/$EngineRepository/releases/latest"
-                $asset = @($release.assets | Where-Object name -CEQ 'csrun.ps1')
-                if ($release.draft -or $release.tag_name -cnotmatch '^v\d+\.\d+\.\d+$' -or $asset.Count -ne 1 -or $asset[0].digest -cnotmatch '^sha256:[a-f0-9]{64}$') { throw 'Latest release has no verifiable csrun.ps1 asset.' }
-                Invoke-WebRequest $engineUrl -OutFile $engine
-                $hash = (Get-FileHash $engine -Algorithm SHA256).Hash.ToLowerInvariant()
-                if ("sha256:$hash" -cne $asset[0].digest -or (Get-Item $engine).Length -ne $asset[0].size) { throw 'Latest engine asset changed or failed integrity validation.' }
+                $publishedEngine = Get-CsrunPublishedEngine $EngineRepository $engine $EngineVersion
+                $release = $publishedEngine.Release
+                $hash = $publishedEngine.Hash
             }
             $tokens = $null; $errors = $null
             $ast = [System.Management.Automation.Language.Parser]::ParseFile($engine, [ref]$tokens, [ref]$errors)
             if ($errors.Count -or -not $ast.ParamBlock -or 'ManifestJson' -notin $ast.ParamBlock.Parameters.Name.VariablePath.UserPath) { throw 'Downloaded engine is not a valid manifest-capable PowerShell script.' }
             $invocation.EngineVersion = $release.tag_name
+            $tagPlan = Resolve-CsrunImageTags $tags $release.tag_name
+            $invocation.Tags = @($tagPlan.Tags | ForEach-Object { "${image}:$_" })
+            $invocation.VersionedTags = @($tagPlan.VersionedTags | ForEach-Object { "${image}:$_" })
+            $invocation.UnresolvedVersionedTags = @()
             $invocation.EngineSha256 = $hash
             foreach ($file in @('container-entrypoint.ps1', 'container-build.ps1')) { Copy-Item -LiteralPath (Join-Path $PSScriptRoot $file) -Destination $context }
             $revision = & git -C $PSScriptRoot rev-parse HEAD
@@ -288,7 +313,7 @@ function BuildAndPublish {
                 $platformArgs = if ($Platform.Count -eq 1) { @('--platform', ($Platform[0] -split '/')[1]) } else { @() }
                 & python (Join-Path $PSScriptRoot 'tools/oci.py') merge $archiveRoot --version $release.tag_name --revision $revision --engine $hash --source $SourceRepository @platformArgs @archives
                 if ($LASTEXITCODE -ne 0) { throw 'Cannot assemble native-verified artifacts.' }
-                & python (Join-Path $PSScriptRoot 'tools/oci.py') publish $archiveRoot --version $release.tag_name --revision $revision --engine $hash --source $SourceRepository @platformArgs --tags @($invocation.Tags)
+                & python (Join-Path $PSScriptRoot 'tools/oci.py') publish $archiveRoot --version $release.tag_name --revision $revision --engine $hash --source $SourceRepository @platformArgs --tags @($invocation.Tags) --versioned-tags @($invocation.VersionedTags)
                 if ($LASTEXITCODE -ne 0) { throw 'Registry promotion or inspection failed.' }
                 $invocation.Published = $true
                 $invocation | Add-Member RegistryImages (Get-Content "$archiveRoot.published.json" -Raw | ConvertFrom-Json)

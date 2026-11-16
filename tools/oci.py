@@ -45,10 +45,14 @@ class Archive:
                         h.update(chunk)
                 require(name == 'blobs/sha256/' + h.hexdigest(), 'Corrupt OCI blob')
         require(self.read('oci-layout') == {'imageLayoutVersion': '1.0.0'}, 'Invalid OCI layout')
-        self.index = self.read('index.json')
+        self.index_bytes = self.tar.extractfile(self.members['index.json']).read()
+        self.index = json.loads(self.index_bytes)
         # Buildx exports a layout index, which may wrap the actual image index.
         while len(self.index['manifests']) == 1 and self.index['manifests'][0]['mediaType'] == INDEX:
-            self.index = self.blob(self.index['manifests'][0])
+            descriptor = self.index['manifests'][0]
+            self.blob(descriptor)  # Validate the wrapper descriptor before unwrapping.
+            self.index_bytes = self.tar.extractfile(self.members['blobs/' + descriptor['digest'].replace(':', '/')]).read()
+            self.index = json.loads(self.index_bytes)
         require(self.index.get('schemaVersion') == 2 and self.index.get('mediaType') == INDEX, 'Expected an OCI image index')
 
     def read(self, name):
@@ -188,7 +192,7 @@ def skopeo(arguments, *, capture=False):
             command.extend(['--volume', str(Path(auth).resolve()) + ':/auth.json:ro', '--env', 'REGISTRY_AUTH_FILE=/auth.json'])
         command.extend(['quay.io/skopeo/stable:v1.20.0', *converted])
     if capture:
-        return subprocess.check_output(command)
+        return subprocess.check_output(command, stderr=subprocess.PIPE)
     subprocess.run(command, check=True)
 
 
@@ -252,25 +256,64 @@ def merge(args):
     return 'sha256:' + digest
 
 
-def publish(args):
+def registry_digest(tag):
+    """Only an explicit registry missing-manifest response means absence."""
+    try:
+        raw = skopeo(['inspect', '--raw', 'docker://' + tag], capture=True)
+    except subprocess.CalledProcessError as error:
+        message = (error.stderr or b'').decode(errors='replace')
+        if re.search(r'\b(?:manifest unknown|name unknown|MANIFEST_UNKNOWN|NAME_UNKNOWN)\b', message):
+            return None
+        raise
+    return 'sha256:' + hashlib.sha256(raw).hexdigest()
+
+
+def preflight(args, *, require_versioned=False):
     check_seal(args.archive)
     archive = Archive(args.archive)
     archive.verify(args, [args.platform] if getattr(args, 'platform', None) else ['amd64', 'arm64'])
-    # Authentication is supplied by the caller, never embedded in the archive.
-    expected = {d['digest'] for d in archive.index['manifests']}
-    digests = set()
-    published = []
+    require(re.fullmatch(r'v(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)', args.version or ''), 'Invalid engine release identity')
     require(args.tags and len({t.rsplit(':', 1)[0] for t in args.tags}) == 1, 'SDK aliases must target one repository')
     for tag in args.tags:
         require(re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._:/-]*:[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}', tag) and tag.rsplit(':', 1)[1] != 'latest', 'Invalid publishing destination')
+    versioned = getattr(args, 'versioned_tags', None)
+    legacy = getattr(args, 'legacy_convenience_only', False) and versioned == []
+    require((versioned or legacy) and len(set(args.tags)) == len(args.tags) and len(set(versioned)) == len(versioned)
+            and set(versioned) < set(args.tags), 'Both unique tag families are required')
+    require(all(t.endswith('-' + args.version) for t in versioned), 'Versioned destination release mismatch')
+    digest = 'sha256:' + hashlib.sha256(archive.index_bytes).hexdigest()
+    if getattr(args, 'expected', None):
+        require(args.expected == digest, 'Saved OCI index digest mismatch')
+    for tag in versioned:
+        existing = registry_digest(tag)
+        require(existing == digest or (existing is None and not require_versioned),
+                f'Release-versioned tag conflict: {tag}; expected {digest}, found {existing}; refusing overwrite')
+    return archive, digest
+
+
+def publish(args, *, family='all', before_convenience=None):
+    archive, expected_digest = preflight(args, require_versioned=family == 'convenience')
+    expected = {d['digest'] for d in archive.index['manifests']}
+    digests = set()
+    published = []
+    convenience = [t for t in args.tags if t not in args.versioned_tags]
+    destinations = ([] if family == 'convenience' else list(args.versioned_tags)) + ([] if family == 'versioned' else convenience)
     # Skopeo's archive transport restores tar ownership, which fails rootless.
     with archive.layout() as layout:
-        for tag in args.tags:
-            skopeo(['copy', '--all', '--preserve-digests', 'oci:' + layout, 'docker://' + tag])
+        for tag in destinations:
+            if tag in convenience and tag == convenience[0] and before_convenience:
+                before_convenience()
+            # Recheck immediately before each write. Registry policy is still needed
+            # to close the check/write race against external or concurrent writers.
+            existing = registry_digest(tag) if tag in args.versioned_tags else None
+            require(existing is None or existing == expected_digest, f'Release-versioned tag conflict: {tag}; refusing overwrite')
+            if existing is None:
+                skopeo(['copy', '--all', '--preserve-digests', 'oci:' + layout, 'docker://' + tag])
             raw = skopeo(['inspect', '--raw', 'docker://' + tag], capture=True)
             index = json.loads(raw)
             require({d['digest'] for d in index['manifests']} == expected, 'Registry platform/attestation identities changed')
             digest = 'sha256:' + hashlib.sha256(raw).hexdigest()
+            require(digest == expected_digest, 'Registry OCI index digest changed')
             digests.add(digest)
             with tempfile.TemporaryDirectory() as temp:
                 downloaded = str(Path(temp) / 'registry.tar')
@@ -283,12 +326,12 @@ def publish(args):
     summary = os.environ.get('GITHUB_STEP_SUMMARY')
     if summary:
         with open(summary, 'a') as stream:
-            stream.write('\nPublished tags: ' + ', '.join(args.tags) + '\n\nDigest: ' + next(iter(digests)) + '\n')
+            stream.write('\nPublished tags: ' + ', '.join(destinations) + '\n\nDigest: ' + next(iter(digests)) + '\n')
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('command', choices=['verify', 'merge', 'publish', 'config', 'loaded-config', 'check-skopeo'])
+    parser.add_argument('command', choices=['verify', 'merge', 'publish', 'preflight', 'config', 'loaded-config', 'check-skopeo'])
     parser.add_argument('archive', nargs='?')
     parser.add_argument('--version')
     parser.add_argument('--revision')
@@ -299,6 +342,7 @@ def main():
     parser.add_argument('--image')
     parser.add_argument('--context')
     parser.add_argument('--tags', nargs='+')
+    parser.add_argument('--versioned-tags', nargs='+')
     parser.add_argument('inputs', nargs='*')
     args = parser.parse_intermixed_args()
     if args.command == 'check-skopeo':
@@ -310,6 +354,8 @@ def main():
         merge(args)
     elif args.command == 'publish':
         publish(args)
+    elif args.command == 'preflight':
+        preflight(args)
     else:
         archive = Archive(args.archive)
         if args.command == 'loaded-config':
