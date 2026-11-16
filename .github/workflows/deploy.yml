@@ -24,6 +24,7 @@ jobs:
     timeout-minutes: 60
     outputs:
       sha: ${{ steps.resolve.outputs.sha }}
+      deployment-sha: ${{ steps.resolve.outputs.deployment-sha }}
     steps:
       - uses: codebeltnet/git-checkout@v1
         with:
@@ -32,7 +33,9 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ github.event.release.tag_name || inputs.tag }}
-        run: python tools/release-images.py resolve
+        run: |
+          echo "deployment-sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          python tools/release-images.py resolve
       - uses: actions/upload-artifact@v7
         with:
           name: resolved-release
@@ -55,7 +58,7 @@ jobs:
     steps:
       - uses: codebeltnet/git-checkout@v1
         with:
-          ref: ${{ needs.resolve.outputs.sha }}
+          ref: ${{ needs.resolve.outputs.deployment-sha }}
       - uses: actions/download-artifact@v8
         with:
           name: resolved-release
@@ -78,7 +81,7 @@ jobs:
     steps:
       - uses: codebeltnet/git-checkout@v1
         with:
-          ref: ${{ needs.resolve.outputs.sha }}
+          ref: ${{ needs.resolve.outputs.deployment-sha }}
       - uses: actions/download-artifact@v8
         with:
           name: resolved-release
