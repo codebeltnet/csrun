@@ -12,7 +12,8 @@ This patch release cleans disposable container output by skipping a specific .NE
 
 - Changed the container-runtime default to `DOTNET_SKIP_WORKLOAD_INTEGRITY_CHECK=true`, skipping the check that workloads from previous SDK feature bands remain accessible to the current SDK to avoid the warning during successful console and xUnit execution; consumers requiring this verification can restore the SDK default with `-e DOTNET_SKIP_WORKLOAD_INTEGRITY_CHECK=false`,
 - Documented the optional-workload limitation and unchanged SDK selection, diagnostics, NuGet behavior, exit codes, image identity, pinned SDK inputs, native architecture tests, and OCI SBOM/provenance controls, which do not replace the skipped check,
-- Extended container regression coverage for warning-free console and genuine xUnit v3 execution, environment overrides, unchanged inventories, real failure diagnostics, and hardened read-only execution, and distinguished earlier local validation from subsequent v0.2.0 native CI and Docker Hub publication evidence.
+- Extended container regression coverage for warning-free console and genuine xUnit v3 execution, environment overrides, unchanged inventories, real failure diagnostics, and hardened read-only execution, and distinguished earlier local validation from subsequent v0.2.0 native CI and Docker Hub publication evidence,
+- Clarified the README title and introduction as C# Example & Test Runner (`csrun`), and reworded the container usage introduction to refer to the published Docker images.
 
 ## [0.2.0] - 2026-11-15
 
