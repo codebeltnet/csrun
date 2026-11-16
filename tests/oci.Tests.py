@@ -5,6 +5,7 @@ import importlib.util
 import json
 from pathlib import Path
 import sys
+import subprocess
 import shutil
 import tarfile
 import tempfile
@@ -44,7 +45,7 @@ class ArtifactTests(unittest.TestCase):
             'org.opencontainers.image.created': '2026-11-15T12:00:00Z',
             'net.codebelt.csrun.engine.release': self.args.version,
             'net.codebelt.csrun.engine.sha256': engine or self.args.engine,
-            'net.codebelt.csrun.sdks': '11.0.100'}}})
+            'net.codebelt.csrun.sdks': ','.join(self.args.sdks)}}})
         image = blob({'config': config, 'layers': []})
         image['platform'] = {'os': 'linux', 'architecture': cpu}
         layers = []
@@ -54,7 +55,7 @@ class ArtifactTests(unittest.TestCase):
                                     'build-arg:ENGINE_VERSION': self.args.version,
                                     'label:org.opencontainers.image.revision': self.args.revision,
                                     'label:org.opencontainers.image.source': source,
-                                    'label:net.codebelt.csrun.sdks': '11.0.100'}}}})]:
+                                    'label:net.codebelt.csrun.sdks': ','.join(self.args.sdks)}}}})]:
             if predicate == missing:
                 continue
             subjects = [] if subject is False else [{'digest': {'sha256': subject or image['digest'][7:]}}]
@@ -158,7 +159,9 @@ class ArtifactTests(unittest.TestCase):
             oci.merge(self.args)
 
     def test_release_assembly_split_and_recovery_reuse_the_tested_bytes(self):
-        tags = ['docker.io/codebeltnet/csrun:11.0.100', 'docker.io/codebeltnet/csrun:11.0', 'docker.io/codebeltnet/csrun:11']
+        convenience = ['docker.io/codebeltnet/csrun:11.0.100', 'docker.io/codebeltnet/csrun:11.0', 'docker.io/codebeltnet/csrun:11']
+        versioned = [t + '-v0.2.0' for t in convenience]
+        tags = convenience + versioned
         for cpu in ('amd64', 'arm64'):
             path, _, config = self.fixture(cpu)
             target = self.root / 'inputs' / cpu
@@ -169,6 +172,7 @@ class ArtifactTests(unittest.TestCase):
             (target / 'csrun-image.json').write_text(json.dumps({
                 'NativeVerified': True, 'SdkVersions': ['11.0.100'], 'EngineVersion': self.args.version,
                 'EngineSha256': self.args.engine, 'SourceCommit': self.args.revision, 'Tags': tags,
+                'ConvenienceTags': convenience, 'VersionedTags': versioned,
                 'Platforms': ['linux/' + cpu], 'ConfigDigest': config['digest'], 'SizeBytes': 1234}))
         with contextlib.chdir(self.root), patch.dict('os.environ', {
             'GITHUB_SHA': self.args.revision, 'GITHUB_REF_NAME': self.args.version,
@@ -190,7 +194,7 @@ class ArtifactTests(unittest.TestCase):
                     return {**run, 'run_attempt': 2, 'conclusion': 'failure'}
                 self.fail('Unexpected GitHub endpoint: ' + endpoint)
 
-            with patch.object(release_images, 'gh', side_effect=get_run), patch.object(release_images.subprocess, 'check_output', return_value=json.dumps(tags)):
+            with patch.object(release_images, 'gh', side_effect=get_run):
                 release_images.restore('11')
                 for changes in ({'conclusion': 'failure'}, {'run_attempt': 2}, {'head_sha': 'c' * 40}, {'event': 'workflow_dispatch'}, {'path': '.github/workflows/other.yml'}, {'head_branch': 'main'}):
                     with self.subTest(changes=changes), patch.object(release_images, 'gh', return_value={**run, **changes}):
@@ -216,13 +220,18 @@ class ArtifactTests(unittest.TestCase):
         self.args.archive = str(self.root / 'combined.tar')
         self.args.inputs = [str(amd), str(arm)]
         self.args.tags = ['docker.io/fork/csrun:11.0.100', 'docker.io/fork/csrun:11']
+        self.args.versioned_tags = ['docker.io/fork/csrun:11.0.100-v0.2.0', 'docker.io/fork/csrun:11-v0.2.0']
+        self.args.tags += self.args.versioned_tags
         oci.merge(self.args)
         original = oci.checksum(self.args.archive)
         archive = oci.Archive(self.args.archive)
         layouts = []
+        present = set()
 
         def transfer(arguments, *, capture=False):
             if arguments[0] == 'inspect':
+                if arguments[-1] not in present:
+                    raise subprocess.CalledProcessError(1, arguments, stderr=b'manifest unknown')
                 return oci.encoded(archive.index)
             self.assertEqual(arguments[:3], ['copy', '--all', '--preserve-digests'])
             if arguments[3].startswith('docker://'):
@@ -231,6 +240,7 @@ class ArtifactTests(unittest.TestCase):
             self.assertTrue(arguments[3].startswith('oci:'))
             layout = Path(arguments[3].removeprefix('oci:'))
             layouts.append(layout)
+            present.add(arguments[-1])
             self.assertEqual({p.relative_to(layout).as_posix() for p in layout.rglob('*') if p.is_file()}, set(archive.members))
             for name, member in archive.members.items():
                 with archive.tar.extractfile(member) as source:
@@ -239,17 +249,19 @@ class ArtifactTests(unittest.TestCase):
         with patch.object(oci, 'skopeo', side_effect=transfer), patch.object(oci.tarfile.TarFile, 'chown', side_effect=PermissionError('ownership restoration forbidden')):
             oci.publish(self.args)
         archive.tar.close()
-        self.assertEqual(len(layouts), 2)
+        self.assertEqual(len(layouts), 4)
         self.assertEqual(layouts[0], layouts[1])
         self.assertFalse(layouts[0].exists())
         self.assertEqual(original, oci.checksum(self.args.archive))
-        self.assertEqual(len(json.loads(Path(self.args.archive + '.published.json').read_text())), 2)
+        self.assertEqual(len(json.loads(Path(self.args.archive + '.published.json').read_text())), 4)
 
     def test_publish_removes_temporary_layout_after_transfer_failure(self):
         path, _, _ = self.fixture('amd64')
         self.args.archive = str(path)
         self.args.platform = 'amd64'
         self.args.tags = ['docker.io/fork/csrun:11']
+        self.args.versioned_tags = ['docker.io/fork/csrun:11-v0.2.0']
+        self.args.tags += self.args.versioned_tags
         layouts = []
 
         def fail_transfer(arguments):
@@ -257,14 +269,153 @@ class ArtifactTests(unittest.TestCase):
             self.assertTrue(layouts[-1].is_dir())
             raise RuntimeError('transfer failed')
 
-        with patch.object(oci, 'skopeo', side_effect=fail_transfer):
+        with patch.object(oci, 'registry_digest', return_value=None), patch.object(oci, 'skopeo', side_effect=fail_transfer):
             with self.assertRaisesRegex(RuntimeError, 'transfer failed'):
                 oci.publish(self.args)
         self.assertFalse(layouts[0].exists())
         self.assertFalse(Path(str(path) + '.published.json').exists())
 
+    def publication(self):
+        amd, _, _ = self.fixture('amd64')
+        arm, _, _ = self.fixture('arm64')
+        self.args.archive = str(self.root / 'combined.tar')
+        self.args.inputs = [str(amd), str(arm)]
+        self.args.tags = ['localhost:5000/fork/csrun:11.0.100', 'localhost:5000/fork/csrun:11']
+        self.args.versioned_tags = ['localhost:5000/fork/csrun:11.0.100-v0.2.0', 'localhost:5000/fork/csrun:11-v0.2.0']
+        self.args.tags += self.args.versioned_tags
+        digest = oci.merge(self.args)
+        archive = oci.Archive(self.args.archive)
+        raw = archive.index_bytes
+        archive.tar.close()
+        return digest, raw
+
+    def test_conflicting_historical_alias_blocks_all_writes(self):
+        digest, _ = self.publication()
+        for conflict in self.args.versioned_tags:
+            with self.subTest(conflict=conflict), patch.object(oci, 'registry_digest', side_effect=lambda tag: 'sha256:' + 'c' * 64 if tag == conflict else digest), patch.object(oci, 'skopeo') as transfer:
+                with self.assertRaisesRegex(ValueError, 'Release-versioned tag conflict.*refusing overwrite'):
+                    oci.publish(self.args)
+                transfer.assert_not_called()
+
+    def test_absent_matching_and_partial_retry_publish_one_index(self):
+        digest, raw = self.publication()
+        present = {}
+        writes = []
+        fail = [True]
+
+        def transfer(arguments, *, capture=False):
+            if arguments[0] == 'inspect':
+                tag = arguments[-1].removeprefix('docker://')
+                if tag not in present:
+                    raise subprocess.CalledProcessError(1, arguments, stderr=b'MANIFEST_UNKNOWN')
+                return present[tag]
+            if arguments[3].startswith('docker://'):
+                shutil.copyfile(self.args.archive, arguments[4].removeprefix('oci-archive:'))
+            else:
+                tag = arguments[-1].removeprefix('docker://')
+                if tag == self.args.versioned_tags[1] and fail[0]:
+                    fail[0] = False
+                    raise RuntimeError('interrupted publication')
+                present[tag] = raw
+                writes.append(tag)
+
+        with patch.object(oci, 'skopeo', side_effect=transfer):
+            with self.assertRaisesRegex(RuntimeError, 'interrupted publication'):
+                oci.publish(self.args)
+            self.assertEqual(writes, self.args.versioned_tags[:1])
+            oci.publish(self.args)
+            self.assertEqual(writes, self.args.versioned_tags + self.args.tags[:2])
+            previous = list(writes)
+            def stale():
+                raise ValueError('refusing stale SDK alias promotion')
+            with self.assertRaisesRegex(ValueError, 'refusing stale'):
+                oci.publish(self.args, before_convenience=stale)
+            self.assertEqual(writes, previous)
+            oci.publish(self.args)
+            self.assertEqual(writes.count(self.args.versioned_tags[0]), 1)
+            self.assertEqual(writes.count(self.args.versioned_tags[1]), 1)
+        records = json.loads(Path(self.args.archive + '.published.json').read_text())
+        self.assertEqual({r['digest'] for r in records}, {digest})
+        self.assertEqual({r['tag'] for r in records}, set(self.args.tags))
+
+    def test_concurrent_conflict_on_recheck_never_overwrites(self):
+        self.publication()
+        with patch.object(oci, 'registry_digest', side_effect=[None, None, 'sha256:' + 'c' * 64]), patch.object(oci, 'skopeo') as transfer:
+            with self.assertRaisesRegex(ValueError, 'refusing overwrite'):
+                oci.publish(self.args)
+            transfer.assert_not_called()
+
+    def test_same_children_with_different_index_bytes_are_rejected(self):
+        _, raw = self.publication()
+        with patch.object(oci, 'registry_digest', return_value=None), patch.object(oci, 'skopeo', return_value=raw + b'\n'):
+            with self.assertRaisesRegex(ValueError, 'OCI index digest changed'):
+                oci.publish(self.args)
+
+    def test_duplicate_or_missing_versioned_families_are_rejected(self):
+        self.publication()
+        for versioned in ([], self.args.versioned_tags * 2, ['localhost:5000/fork/csrun:11-v0.1.0']):
+            with self.subTest(versioned=versioned), patch.object(oci, 'skopeo') as transfer:
+                args = SimpleNamespace(**{**vars(self.args), 'versioned_tags': versioned})
+                with self.assertRaises(ValueError):
+                    oci.publish(args)
+                transfer.assert_not_called()
+
+    def test_convenience_phase_requires_all_versioned_aliases_to_exist(self):
+        self.publication()
+        with patch.object(oci, 'registry_digest', return_value=None), patch.object(oci, 'skopeo') as transfer:
+            with self.assertRaisesRegex(ValueError, 'refusing overwrite'):
+                oci.publish(self.args, family='convenience')
+            transfer.assert_not_called()
+
+    def test_historical_recovery_keeps_original_convenience_only_contract(self):
+        _, raw = self.publication()
+        self.args.tags = self.args.tags[:2]
+        self.args.versioned_tags = []
+        self.args.legacy_convenience_only = True
+        writes = []
+        def transfer(arguments, *, capture=False):
+            if arguments[0] == 'inspect':
+                return raw
+            if arguments[3].startswith('docker://'):
+                shutil.copyfile(self.args.archive, arguments[4].removeprefix('oci-archive:'))
+            else:
+                writes.append(arguments[-1].removeprefix('docker://'))
+        with patch.object(oci, 'skopeo', side_effect=transfer):
+            oci.publish(self.args)
+        self.assertEqual(writes, self.args.tags)
+
+    def test_all_six_aliases_share_exact_index_for_each_sdk_variant(self):
+        for sdks, aliases in ((['10.0.404'], ['10.0.404', '10.0', '10']),
+                              (['11.0.100'], ['11.0.100', '11.0', '11']),
+                              (['10.0.404', '11.0.100'], ['10.0.404-11.0.100', '10.0-11.0', '10-11'])):
+            with self.subTest(sdks=sdks):
+                self.args.sdks = sdks
+                digest, raw = self.publication()
+                convenience = ['registry.example/fork/csrun:' + tag for tag in aliases]
+                self.args.versioned_tags = [tag + '-v0.2.0' for tag in convenience]
+                self.args.tags = convenience + self.args.versioned_tags
+                def transfer(arguments, *, capture=False):
+                    if arguments[0] == 'inspect':
+                        return raw
+                    if arguments[3].startswith('docker://'):
+                        shutil.copyfile(self.args.archive, arguments[4].removeprefix('oci-archive:'))
+                with patch.object(oci, 'registry_digest', return_value=None), patch.object(oci, 'skopeo', side_effect=transfer):
+                    oci.publish(self.args)
+                records = json.loads(Path(self.args.archive + '.published.json').read_text())
+                self.assertEqual(len(records), 6)
+                self.assertEqual({r['tag'] for r in records}, set(self.args.tags))
+                self.assertEqual({r['digest'] for r in records}, {digest})
+
 
 class SkopeoTransportTests(unittest.TestCase):
+    def test_registry_absence_is_distinct_from_auth_network_and_server_failures(self):
+        for message in (b'manifest unknown', b'MANIFEST_UNKNOWN', b'name unknown'):
+            with patch.object(oci, 'skopeo', side_effect=subprocess.CalledProcessError(1, 'inspect', stderr=message)):
+                self.assertIsNone(oci.registry_digest('registry/image:11'))
+        for message in (b'unauthorized', b'connection refused', b'500 Internal Server Error', b'404 proxy not found'):
+            with patch.object(oci, 'skopeo', side_effect=subprocess.CalledProcessError(1, 'inspect', stderr=message)):
+                with self.assertRaises(subprocess.CalledProcessError):
+                    oci.registry_digest('registry/image:11')
     def test_local_container_mounts_oci_layout_directory(self):
         with patch.dict('os.environ', {'DOCKER_HOST': 'unix:///var/run/docker.sock'}, clear=True), patch.object(oci.shutil, 'which', return_value=None), patch.object(oci.subprocess, 'run') as execute:
             oci.skopeo(['copy', '--all', '--preserve-digests', 'oci:client-layout', 'docker://registry/image:11'])
@@ -303,6 +454,45 @@ class SkopeoTransportTests(unittest.TestCase):
 
 
 class DeploymentIdentityTests(unittest.TestCase):
+    def test_saved_metadata_validates_both_families_using_explicit_release(self):
+        convenience = ['docker.io/codebeltnet/csrun:11.0.100', 'docker.io/codebeltnet/csrun:11.0', 'docker.io/codebeltnet/csrun:11']
+        versioned = ['docker.io/codebeltnet/csrun:11.0.100-v0.2.2', 'docker.io/codebeltnet/csrun:11.0-v0.2.2', 'docker.io/codebeltnet/csrun:11-v0.2.2']
+        meta = {'EngineVersion': 'v0.2.2', 'SdkVersions': ['11.0.100'], 'ConvenienceTags': convenience, 'VersionedTags': versioned, 'Tags': convenience + versioned}
+        release_images.validate_tags(meta)
+        for key in ('Tags', 'ConvenienceTags', 'VersionedTags'):
+            with self.subTest(key=key):
+                with self.assertRaisesRegex(ValueError, 'aliases differ'):
+                    release_images.validate_tags({**meta, key: ['docker.io/codebeltnet/csrun:11-v0.1.0']})
+        legacy = {k: v for k, v in meta.items() if k not in ('ConvenienceTags', 'VersionedTags')}
+        legacy['Tags'] = convenience
+        release_images.validate_tags(legacy)
+        self.assertNotIn('VersionedTags', legacy)
+
+    def test_all_variants_preflight_before_any_publication(self):
+        with tempfile.TemporaryDirectory() as temp, contextlib.chdir(temp):
+            def restore(variant):
+                Path('out').mkdir()
+                Path('out/release.json').write_text(json.dumps({'variant': variant}))
+            def args(meta, path):
+                return SimpleNamespace(variant=meta['variant'], legacy_convenience_only=False)
+            events = []
+            with patch.object(release_images, 'current_release'), patch.object(release_images, 'restore', side_effect=restore), patch.object(release_images, 'publication_args', side_effect=args), patch.object(oci, 'preflight', side_effect=lambda a: events.append(('preflight', a.variant))), patch.object(oci, 'publish', side_effect=lambda a, **kw: events.append((kw['family'], a.variant))):
+                release_images.publish_all()
+            self.assertEqual(events, [(phase, variant) for phase in ('preflight', 'versioned', 'convenience') for variant in ('10', '11', '10-11')])
+            with patch.object(release_images, 'current_release'), patch.object(release_images, 'restore', side_effect=restore), patch.object(release_images, 'publication_args', side_effect=args), patch.object(oci, 'preflight', side_effect=[None, None, ValueError('conflict')]), patch.object(oci, 'publish') as publish:
+                with self.assertRaisesRegex(ValueError, 'conflict'):
+                    release_images.publish_all()
+                publish.assert_not_called()
+
+    def test_latest_changing_after_verification_blocks_promotion(self):
+        with tempfile.TemporaryDirectory() as temp, contextlib.chdir(temp):
+            Path('resolved').mkdir()
+            Path('resolved/identity.json').write_text(json.dumps({'releaseId': 1, 'tag': 'v0.2.0'}))
+            with patch.dict('os.environ', {'GITHUB_REPOSITORY': 'codebeltnet/csrun'}), patch.object(release_images, 'gh', return_value={'id': 2}), patch.object(oci, 'publish') as publish:
+                with self.assertRaisesRegex(ValueError, 'refusing stale'):
+                    release_images.publish()
+                publish.assert_not_called()
+
     def test_recovery_from_a_feature_branch_is_rejected(self):
         with patch.dict('os.environ', {'GITHUB_REPOSITORY': 'codebeltnet/csrun', 'RELEASE_TAG': 'v0.2.0', 'GITHUB_EVENT_NAME': 'workflow_dispatch', 'GITHUB_REF': 'refs/heads/feature'}):
             with self.assertRaisesRegex(ValueError, 'from main'):
