@@ -1,6 +1,6 @@
-# csrun
+# C# Example & Test Runner
 
-Run a complete C# console example or genuine xUnit v3 tests with one command. Choose native PowerShell execution or a disposable Linux container; both consume manifest schema version 1 through the same csrun engine.
+C# Example & Test Runner (`csrun`) runs a complete C# console example or genuine xUnit v3 tests with one command. Choose native PowerShell execution or a disposable Linux container; both consume manifest schema version 1 through the same csrun engine.
 
 Native execution requires PowerShell 7 and an installed .NET 10+ SDK with support for file-based applications and the requested target framework/runtime. Container execution requires Docker with Linux containers, and supplies PowerShell and the explicitly selected SDKs inside the image. Docker Desktop on Windows works from PowerShell 7 without installing .NET on the host. Network access is required for Microsoft's release metadata and uncached NuGet dependencies. The runner never installs SDKs or retargets source.
 
