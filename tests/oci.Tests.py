@@ -418,9 +418,21 @@ class PowerShellInvocationTests(unittest.TestCase):
 
 
 class SkopeoTransportTests(unittest.TestCase):
+    def test_captured_registry_errors_keep_diagnostics_in_exception_text(self):
+        for operation in (lambda: oci.registry_digest('registry/image:11'),
+                          lambda: oci.skopeo(['inspect', '--raw', 'docker://registry/image:11'], capture=True)):
+            for message in (b'unauthorized: login expired', b'denied: access forbidden', b'connection refused'):
+                error = subprocess.CalledProcessError(23, ['skopeo', 'inspect'], output=b'', stderr=message)
+                with self.subTest(message=message, operation=operation), patch.object(oci, 'check_skopeo', return_value=True), patch.object(oci.subprocess, 'check_output', side_effect=error):
+                    with self.assertRaises(subprocess.CalledProcessError) as caught:
+                        operation()
+                    self.assertIn(message.decode(), str(caught.exception))
+                    self.assertEqual(caught.exception.returncode, 23)
+                    self.assertEqual(caught.exception.stderr, message)
+
     def test_registry_absence_is_distinct_from_auth_network_and_server_failures(self):
         for message in (b'manifest unknown', b'MANIFEST_UNKNOWN', b'name unknown'):
-            with patch.object(oci, 'skopeo', side_effect=subprocess.CalledProcessError(1, 'inspect', stderr=message)):
+            with patch.object(oci, 'check_skopeo', return_value=True), patch.object(oci.subprocess, 'check_output', side_effect=subprocess.CalledProcessError(1, 'inspect', stderr=message)):
                 self.assertIsNone(oci.registry_digest('registry/image:11'))
         for message in (b'unauthorized', b'connection refused', b'500 Internal Server Error', b'404 proxy not found'):
             with patch.object(oci, 'skopeo', side_effect=subprocess.CalledProcessError(1, 'inspect', stderr=message)):

@@ -172,6 +172,13 @@ def check_skopeo():
     return False
 
 
+class SkopeoError(subprocess.CalledProcessError):
+    """Retain captured diagnostics in CLI tracebacks and caller error messages."""
+    def __str__(self):
+        detail = (self.stderr or b'').decode(errors='replace').strip()
+        return super().__str__() + ('\n' + detail if detail else '')
+
+
 def skopeo(arguments, *, capture=False):
     """Use native Skopeo or a versioned utility container, including on Windows."""
     if check_skopeo():
@@ -192,7 +199,12 @@ def skopeo(arguments, *, capture=False):
             command.extend(['--volume', str(Path(auth).resolve()) + ':/auth.json:ro', '--env', 'REGISTRY_AUTH_FILE=/auth.json'])
         command.extend(['quay.io/skopeo/stable:v1.20.0', *converted])
     if capture:
-        return subprocess.check_output(command, stderr=subprocess.PIPE)
+        try:
+            return subprocess.check_output(command, stderr=subprocess.PIPE)
+        except subprocess.CalledProcessError as error:
+            # Missing-manifest responses can still be handled quietly by the
+            # caller; unexpected errors retain stderr when propagated.
+            raise SkopeoError(error.returncode, error.cmd, output=error.output, stderr=error.stderr) from None
     subprocess.run(command, check=True)
 
 
