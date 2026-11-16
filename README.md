@@ -1,6 +1,6 @@
-# csrun
+# C# Example & Test Runner
 
-Run a complete C# console example or genuine xUnit v3 tests with one command. Choose native PowerShell execution or a disposable Linux container; both consume manifest schema version 1 through the same csrun engine.
+C# Example & Test Runner (`csrun`) runs a complete C# console example or genuine xUnit v3 tests with one command. Choose native PowerShell execution or a disposable Linux container; both consume manifest schema version 1 through the same csrun engine.
 
 Native execution requires PowerShell 7 and an installed .NET 10+ SDK with support for file-based applications and the requested target framework/runtime. Container execution requires Docker with Linux containers, and supplies PowerShell and the explicitly selected SDKs inside the image. Docker Desktop on Windows works from PowerShell 7 without installing .NET on the host. Network access is required for Microsoft's release metadata and uncached NuGet dependencies. The runner never installs SDKs or retargets source.
 
@@ -29,7 +29,7 @@ Executing remote code requires trusting **both the script publisher and the C# s
 
 ## Disposable container execution
 
-After the maintainer publishes the Docker images, pipe the same manifest directly to Docker. No clipboard operation, file, clone, volume mount, or profile customization is needed:
+Pipe the same manifest directly to the published Docker images. No clipboard operation, file, clone, volume mount, or profile customization is needed:
 
 The examples use PowerShell syntax; any shell that can write UTF-8 JSON to Docker's stdin can use the container path without host PowerShell.
 
@@ -59,6 +59,16 @@ docker run --rm --entrypoint dotnet codebeltnet/csrun:10 --list-runtimes
 ```
 
 The `net.codebelt.csrun.engine.release` and `net.codebelt.csrun.engine.sha256` labels identify the exact bundled asset. OCI `version` identifies that engine release; OCI `revision` identifies the packaging source commit. Published Buildx metadata records the registry digest; retain it with release notes for immutable consumers.
+
+### Workload integrity verification
+
+The csrun container images set `DOTNET_SKIP_WORKLOAD_INTEGRITY_CHECK=true` to skip the .NET SDK's first-run check that workloads installed under previous SDK feature bands remain accessible to the current SDK. See [Microsoft's documentation](https://learn.microsoft.com/en-us/dotnet/core/tools/dotnet-environment-variables#dotnet_skip_workload_integrity_check) for its meaning and scope.
+
+These explicitly selected SDK environments run short-lived console examples and genuine xUnit v3 tests in disposable containers. The check can emit `An issue was encountered verifying workloads` despite successful execution, so the image skips this specific check by default. This is a container-runtime default; native csrun execution is unchanged.
+
+The trade-off is that normal container execution does not perform this particular workload integrity check. Consumers relying on optional .NET workloads should account for that limitation. SDK selection, compilation errors, NuGet restore behavior and verification, test failures, exit codes, and normal diagnostics remain unchanged, as do SDK vulnerability checking, image identity and build checksum verification, pinned SDK inputs, SDK inventory validation, native architecture tests, and OCI SBOM/provenance validation. Those controls are not equivalent to the skipped workload integrity check.
+
+When workload integrity verification is required, restore the SDK's default behavior by explicitly passing `-e DOTNET_SKIP_WORKLOAD_INTEGRITY_CHECK=false`, for example `docker run --rm -i -e DOTNET_SKIP_WORKLOAD_INTEGRITY_CHECK=false codebeltnet/csrun:10` with a manifest on stdin. This is a narrow disposable-container policy, not a general recommendation to disable SDK checks.
 
 ### Isolation and writable paths
 

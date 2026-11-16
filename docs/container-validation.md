@@ -1,6 +1,6 @@
 # Container validation
 
-The initial validation below predates the OCI delivery changes. Local validation on 2026-11-15 uses Windows PowerShell 7, Docker Desktop 4.97.0 with Linux AMD64 containers, Docker Engine 29.9.2 and Buildx 0.38.1. No images were published. The native executor is unchanged from the released source.
+The initial validation below predates the OCI delivery changes. Local validation on 2026-11-15 used PowerShell 7 on Windows, Docker Desktop 4.97.0 with Linux AMD64 containers, Docker Engine 29.9.2 and Buildx 0.38.1. That local session published no images. Subsequent native CI validation and v0.2.0 Docker Hub publication are recorded separately below. The native executor is unchanged from the released source.
 
 ## Engine and base identities
 
@@ -56,11 +56,45 @@ Refreshed export measurements are below. Docker reports local image storage diff
 | `11` | 1,427,258,798 | 360,735,744 |
 | `10-11` | 2,734,862,369 | 608,526,336 |
 
-Candidate verification uses checked-out bytes, annotated `v0.2.0`; this is not evidence that a v0.2.0 GitHub Release has been published. Their script checksum remains `6609acb7ac9df5cbbbf70d58b3dbc40f2d242e34831f89c7b42d7069015db802`.
+The earlier local candidate verification used checked-out bytes, annotated `v0.2.0`; that evidence alone did not establish publication. Its script checksum was `6609acb7ac9df5cbbbf70d58b3dbc40f2d242e34831f89c7b42d7069015db802`.
+
+## Subsequent v0.2.0 CI and publication evidence
+
+The [v0.2.0 release run](https://github.com/codebeltnet/csrun/actions/runs/43772479751) subsequently passed all six native container jobs: SDK variants `10`, `11`, and `10-11` on AMD64 (`ubuntu-26.04`) and ARM64 (`ubuntu-26.04-arm`), plus both Windows engine jobs and release artifact preparation. This establishes native ARM64 execution beyond the earlier local fixtures. The [v0.2.0 GitHub Release](https://github.com/codebeltnet/csrun/releases/tag/v0.2.0) was published on 2026-11-15.
+
+The successful [Docker Hub deployment run](https://github.com/codebeltnet/csrun/actions/runs/43777998665) on 2026-11-16 validated the saved release artifacts for all three SDK variants and promoted them without rebuilding, including registry content inspection. These are subsequent CI/publication results, not claims about the earlier local session or validation of v0.2.1.
+
+## v0.2.1 workload integrity policy
+
+The maintainer confirmed that both documented console and xUnit commands returned `0` with the expected output but also emitted `An issue was encountered verifying workloads. For more information, run "dotnet workload update".` Setting `DOTNET_SKIP_WORKLOAD_INTEGRITY_CHECK=true` eliminated that warning; `DOTNET_CLI_WORKLOAD_UPDATE_NOTIFY_DISABLE=true` was tested and did not solve it.
+
+The Dockerfile now sets only `DOTNET_SKIP_WORKLOAD_INTEGRITY_CHECK=true` in its existing container environment declarations. According to [Microsoft](https://learn.microsoft.com/en-us/dotnet/core/tools/dotnet-environment-variables#dotnet_skip_workload_integrity_check), this skips the first-run check that workloads from previous SDK feature bands remain accessible to the current SDK. Disposable console/test execution therefore omits that particular check; consumers relying on optional workloads must account for the limitation and can restore the default with `-e DOTNET_SKIP_WORKLOAD_INTEGRITY_CHECK=false`. Native execution is unchanged. No stderr filtering or changes to NuGet verification, compiler diagnostics, SDK vulnerability checking, SDK selection, inventories, or OCI identity/SBOM/provenance validation are introduced. Those controls do not replace the skipped check.
+
+The extended container suite checks the declared default and its value inside a running console manifest, an explicit `false` override in the entry point's process before SDK execution, successful console and genuine xUnit v3 execution without the warning in combined stdout/stderr, compilation and assertion diagnostics with their nonzero exit codes, identical SDK/runtime inventories with the check enabled and skipped, and hardened read-only execution. The override test does not require the restored SDK integrity check to succeed.
+
+### Local patch verification (2026-11-16)
+
+Both README manifests were reproduced against the existing local `codebeltnet/csrun:10` image labelled `v0.2.0`: console output `42`, one discovered/passing xUnit test, exit `0` for each, and the workload warning in both combined output captures. This independently confirms the maintainer's reproduction.
+
+Candidate images were built from the worktree with `BuildAndPublish -BuildOnly`, the unchanged local engine labelled `v0.2.1`, and exact SDK inputs `10.0.404` and `11.0.100`. These are local test artifacts, not published v0.2.1 release artifacts. Docker Desktop's native AMD64 daemon was used; this does not establish execution on the requested GitHub-hosted Ubuntu runners.
+
+| SDK variant | Native local AMD64 container checks | OCI SBOM/provenance and loaded-config verification |
+| --- | --- | --- |
+| `10` | 23 passed, 0 failed | Passed |
+| `11` | 23 passed, 0 failed | Passed |
+| `10-11` | 24 passed, 0 failed | Passed |
+
+All 70 container checks passed. For every installed channel, console output `42` and one discovered/passing xUnit test retained exit `0` without the workload warning in combined stdout/stderr. Compilation errors retained exit `1` and compiler diagnostics; failed assertions retained exit `2` and assertion diagnostics; no-test execution retained exit `8`. Inventory comparisons, the explicit environment override, and hardened read-only console/test execution passed in every variant. Each exported OCI archive passed the existing identity, SPDX SBOM, SLSA provenance, and byte-equivalent loaded-config verification.
+
+- Standalone Windows engine: 91 checks passed with SDK `11.0.100`; 15 compatibility checks passed with SDK `10.0.115`.
+- Independent publishing module: 12 contract checks passed; OCI artifact/lifecycle suite: 27 tests passed.
+- PowerShell parsing and `git diff --check` passed. `csrun.ps1` retains SHA-256 `6609acb7ac9df5cbbbf70d58b3dbc40f2d242e34831f89c7b42d7069015db802`; manifest schema version 1, entry point, publishing module, OCI tooling, and workflows are unchanged.
+
+Native ARM64 is unavailable in the configured local Docker contexts. The unchanged CI matrix still requires SDK variants `10`, `11`, and `10-11` on both `ubuntu-26.04` (AMD64) and `ubuntu-26.04-arm` (ARM64). That v0.2.1 hosted matrix was not run: the patch remains local, with no push, release creation, or image publication authorized. Historical v0.2.0 CI results above do not substitute for this validation.
 
 ## Limits and release work
 
-- The earlier local ARM64 `exec format error` is a host execution limitation, not a confirmed image defect. No privileged emulation was installed. Real ARM64 execution is required on `ubuntu-26.04-arm`; AMD64 uses `ubuntu-26.04`. Neither GitHub-hosted runner has been exercised in this session, and native ARM64 support is not established by local exports or fixture tests.
-- No Docker Hub credentials were used and no registry publication or registry attestation preservation has been verified. BuildKit predicate validation does not introduce a separate signing authority. Authorized CI execution and a real push plus immutable registry inspection remain required before release completion.
+- The earlier local ARM64 `exec format error` was a host execution limitation, not a confirmed image defect. No privileged emulation was installed. Subsequent v0.2.0 CI established native ARM64 execution; v0.2.1 still requires its own native matrix on `ubuntu-26.04` and `ubuntu-26.04-arm` before release completion.
+- No Docker Hub credentials or publication are used for this patch's local validation. The successful v0.2.0 deployment is historical evidence; v0.2.1 publication and registry inspection require separate authorization. BuildKit predicate validation does not introduce a separate signing authority.
 - Release preparation packages the candidate engine and native-tested platform content into durable, checksummed draft GitHub Release assets. After publication, CD resolves the canonical latest script once, requires its release identity and exact checksum to match, and promotes existing content. Deployment recovery never rebuilds or substitutes missing artifacts.
-- Configure required branch checks and reviewers for the `Production` environment before enabling publication. Only its publishing step receives Docker Hub credentials. See the README for the independent manual builder, native remote contexts, release asset storage and controlled recovery procedures.
+- Preserve required branch checks and the `Production` approval controls. Only its publishing step receives Docker Hub credentials. See the README for the independent manual builder, native remote contexts, release asset storage and controlled recovery procedures.

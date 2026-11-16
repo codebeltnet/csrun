@@ -4,6 +4,17 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.1] - 2026-11-16
+
+This patch release cleans disposable container output by skipping a specific .NET SDK first-run workload integrity check, with the verification trade-off and opt-in restoration documented. The standalone native PowerShell engine (`csrun.ps1`) and manifest schema version 1 remain unchanged.
+
+### Changed
+
+- Changed the container-runtime default to `DOTNET_SKIP_WORKLOAD_INTEGRITY_CHECK=true`, skipping the check that workloads from previous SDK feature bands remain accessible to the current SDK to avoid the warning during successful console and xUnit execution; consumers requiring this verification can restore the SDK default with `-e DOTNET_SKIP_WORKLOAD_INTEGRITY_CHECK=false`,
+- Documented the optional-workload limitation and unchanged SDK selection, diagnostics, NuGet behavior, exit codes, image identity, pinned SDK inputs, native architecture tests, and OCI SBOM/provenance controls, which do not replace the skipped check,
+- Extended container regression coverage for warning-free console and genuine xUnit v3 execution, environment overrides, unchanged inventories, real failure diagnostics, and hardened read-only execution, and distinguished earlier local validation from subsequent v0.2.0 native CI and Docker Hub publication evidence,
+- Clarified the README title and introduction as C# Example & Test Runner (`csrun`), and reworded the container usage introduction to refer to the published Docker images.
+
 ## [0.2.0] - 2026-11-15
 
 This minor release adds optional disposable Ubuntu container execution and SDK environment publishing, while the standalone native PowerShell engine (`csrun.ps1`) and manifest schema version 1 remain unchanged.
@@ -37,5 +48,6 @@ This is the first release that introduces csrun as a standalone PowerShell scrip
 - Added pull request and tag release workflows that run the test suite on Windows with the .NET 11 SDK and a .NET 10 compatibility job, then create a draft GitHub release with the tested `csrun.ps1` attached,
 - Added the MIT license.
 
+[0.2.1]: https://github.com/codebeltnet/csrun/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/codebeltnet/csrun/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/codebeltnet/csrun/releases/tag/v0.1.0

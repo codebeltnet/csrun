@@ -51,6 +51,9 @@ function Invoke-Docker([string[]] $Arguments, [string] $InputText = '') {
 function Assert-Result($Result, [int] $Code = 0, [string] $Pattern = '') {
     if ($Result.Code -ne $Code -or ($Pattern -and $Result.Text -notmatch $Pattern)) { throw "Expected exit $Code and /$Pattern/; got $($Result.Code):`n$($Result.Text)" }
 }
+function Assert-NoWorkloadWarning($Result) {
+    if ($Result.Text -match 'An issue was encountered verifying workloads') { throw "Unexpected workload integrity warning:`n$($Result.Text)" }
+}
 function Test-Case([string] $Name, [scriptblock] $Body) {
     try { & $Body; $script:passed++; Write-Host "PASS $Name" }
     catch { $script:failed++; Write-Host "FAIL $Name`n$_" }
@@ -83,6 +86,11 @@ Test-Case 'exact installed SDK and associated runtime inventories' {
     $sdks = Invoke-Docker @('run', '--rm', '--platform', $Platform, '--entrypoint', 'dotnet', $Image, '--list-sdks')
     $runtimes = Invoke-Docker @('run', '--rm', '--platform', $Platform, '--entrypoint', 'dotnet', $Image, '--list-runtimes')
     Assert-Result $sdks; Assert-Result $runtimes
+    foreach ($inventory in @(@{ Option='--list-sdks'; Result=$sdks }, @{ Option='--list-runtimes'; Result=$runtimes })) {
+        $defaultCheck = Invoke-Docker @('run', '--rm', '--platform', $Platform, '-e', 'DOTNET_SKIP_WORKLOAD_INTEGRITY_CHECK=false', '--entrypoint', 'dotnet', $Image, $inventory.Option)
+        Assert-Result $defaultCheck
+        if ($defaultCheck.Out -cne $inventory.Result.Out) { throw "Workload integrity setting changed $($inventory.Option) inventory." }
+    }
     Write-Host $sdks.Out; Write-Host $runtimes.Out
     $installed = @($sdks.Out -split '\r?\n' | Where-Object { $_ } | ForEach-Object { ($_ -split ' ')[0] })
     if (@(Compare-Object $SdkVersion $installed).Count) { throw 'SDK inventory differs from explicit build inputs.' }
@@ -99,6 +107,16 @@ Test-Case 'exact installed SDK and associated runtime inventories' {
     $actual = @($runtimes.Out -split '\r?\n' | Where-Object { $_ } | ForEach-Object { ($_ -split ' ')[0..1] -join ' ' })
     if (@(Compare-Object @($expected | Select-Object -Unique) $actual).Count) { throw 'Runtime inventory differs from requested SDK-associated runtimes.' }
 }
+Test-Case 'container workload integrity default and explicit override' {
+    $config = Invoke-Docker @('image', 'inspect', $Image)
+    Assert-Result $config
+    if ('DOTNET_SKIP_WORKLOAD_INTEGRITY_CHECK=true' -cnotin @($config.Out | ConvertFrom-Json)[0].Config.Env) { throw 'Missing container workload integrity default.' }
+    Assert-Result (Invoke-Manifest (New-Manifest 'Console.WriteLine(Environment.GetEnvironmentVariable("DOTNET_SKIP_WORKLOAD_INTEGRITY_CHECK"));')) 0 '(?m)^true\r?$'
+    # Observe the override in the entry point's process before SDK execution; the
+    # restored workload check itself need not succeed in this disposable image.
+    $command = '[Console]::WriteLine($env:DOTNET_SKIP_WORKLOAD_INTEGRITY_CHECK); & /opt/csrun/container-entrypoint.ps1'
+    Assert-Result (Invoke-Docker @('run', '--rm', '-i', '--platform', $Platform, '-e', 'DOTNET_SKIP_WORKLOAD_INTEGRITY_CHECK=false', '--entrypoint', 'pwsh', $Image, '-NoProfile', '-Command', $command) '{bad') 1 '(?m)^false\r?$'
+}
 Test-Case 'bundled release asset hash and image metadata' {
     $config = Invoke-Docker @('image', 'inspect', $Image)
     Assert-Result $config
@@ -111,11 +129,14 @@ Test-Case 'bundled release asset hash and image metadata' {
 }
 foreach ($channel in $channels) {
     Test-Case "console stdin executes net$channel" {
-        Assert-Result (Invoke-Manifest (New-Manifest 'Console.WriteLine(42);' -Framework "net$channel")) 0 '(?m)^42\r?$'
+        $result = Invoke-Manifest (New-Manifest 'Console.WriteLine(42);' -Framework "net$channel")
+        Assert-Result $result 0 '(?m)^42\r?$'
+        Assert-NoWorkloadWarning $result
     }
     Test-Case "genuine xUnit discovery and passing Fact net$channel" {
         $result = Invoke-Manifest (New-Manifest 'using Xunit; public class SmokeTest { [Fact] public void Pass() => Assert.True(true); }' test "net$channel")
         Assert-Result $result 0 'total:\s+1'
+        Assert-NoWorkloadWarning $result
         if ($result.Text -notmatch 'succeeded:\s+1' -or $result.Text -notmatch 'failed:\s+0') { throw $result.Text }
         Write-Host $result.Text
     }
@@ -152,7 +173,9 @@ Test-Case 'compilation failure remains nonzero' {
     Assert-Result (Invoke-Manifest (New-Manifest 'this is not C#;')) 1 'error CS'
 }
 Test-Case 'failing xUnit assertion preserves MTP exit 2' {
-    Assert-Result (Invoke-Manifest (New-Manifest 'using Xunit; public class T { [Fact] public void Fail() => Assert.True(false); }' test)) 2 'failed:\s+1'
+    $result = Invoke-Manifest (New-Manifest 'using Xunit; public class T { [Fact] public void Fail() => Assert.True(false); }' test)
+    Assert-Result $result 2 'failed:\s+1'
+    if ($result.Text -notmatch 'Assert.True\(\) Failure') { throw "Missing assertion diagnostic: $($result.Text)" }
 }
 Test-Case 'no tests preserves MTP exit 8' {
     Assert-Result (Invoke-Manifest (New-Manifest 'public class NoTests { }' test)) 8 'total:\s+0'
@@ -216,8 +239,12 @@ Test-Case 'non-root and no implicit host mounts; disposable storage' {
     Assert-Result (Invoke-Docker @('run', '--rm', '--platform', $Platform, '--entrypoint', 'sh', $Image, '-c', 'test ! -e /tmp/csrun-marker'))
 }
 Test-Case 'read-only root, writable executable tmpfs and resource restrictions' {
-    Assert-Result (Invoke-Manifest (New-Manifest 'Console.WriteLine("hardened console");') -Hardened) 0 'hardened console'
-    Assert-Result (Invoke-Manifest (New-Manifest 'using Xunit; public class T { [Fact] public void Pass() => Assert.True(true); }' test) -Hardened) 0 'succeeded:\s+1'
+    $console = Invoke-Manifest (New-Manifest 'Console.WriteLine("hardened console");') -Hardened
+    Assert-Result $console 0 'hardened console'
+    Assert-NoWorkloadWarning $console
+    $test = Invoke-Manifest (New-Manifest 'using Xunit; public class T { [Fact] public void Pass() => Assert.True(true); }' test) -Hardened
+    Assert-Result $test 0 'succeeded:\s+1'
+    Assert-NoWorkloadWarning $test
     Assert-Result (Invoke-Manifest (New-Manifest 'using Xunit; public class T { [Fact] public void Fail() => Assert.True(false); }' test) -Hardened) 2 'failed:\s+1'
 }
 Test-Case 'bundled engine validates input without network access' {
