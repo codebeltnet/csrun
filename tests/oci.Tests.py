@@ -3,6 +3,7 @@ import hashlib
 import contextlib
 import importlib.util
 import json
+import os
 from pathlib import Path
 import sys
 import subprocess
@@ -405,6 +406,15 @@ class ArtifactTests(unittest.TestCase):
                 self.assertEqual(len(records), 6)
                 self.assertEqual({r['tag'] for r in records}, set(self.args.tags))
                 self.assertEqual({r['digest'] for r in records}, {digest})
+
+
+class PowerShellInvocationTests(unittest.TestCase):
+    def test_publishing_contract_from_parent_script_matches_ci_invocation(self):
+        script = Path(__file__).resolve().with_name('BuildAndPublish.Tests.ps1')
+        result = subprocess.run(['pwsh', '-NoProfile', '-Command', '& $env:CSRUN_PUBLISHING_TESTS'],
+                                env={**os.environ, 'CSRUN_PUBLISHING_TESTS': str(script)}, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn('14 passed, 0 failed', result.stdout)
 
 
 class SkopeoTransportTests(unittest.TestCase):

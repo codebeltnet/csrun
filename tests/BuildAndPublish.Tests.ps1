@@ -133,6 +133,7 @@ Test-Case 'exact historical SDK lookup uses channel metadata without substitutio
 }
 Test-Case 'downloaded fork release is authoritative and explicit versions must match' {
     & $module {
+        param([scriptblock] $AssertThrows)
         $destination = Join-Path ([IO.Path]::GetTempPath()) ('csrun-engine-test-' + [guid]::NewGuid().ToString('N'))
         $script:release = @{id=123; draft=$false; prerelease=$false; tag_name='v1.2.3'; assets=@(@{name='csrun.ps1'; digest='sha256:6f5237ab16b004222196b68b22fbca3273d5803611518e1b3f2bcb303e0ab7637'; size=6})}
         function Invoke-RestMethod { param($Uri) if ($Uri -cne 'https://api.github.com/repos/fork/csrun/releases/latest') { throw 'Unexpected repository.' }; $script:release }
@@ -143,20 +144,20 @@ Test-Case 'downloaded fork release is authoritative and explicit versions must m
             $actual = Get-CsrunPublishedEngine fork/csrun $destination ''
             if ($actual.Release.tag_name -cne 'v1.2.3') { throw 'Lost authoritative engine identity.' }
             $null = Get-CsrunPublishedEngine fork/csrun $destination v1.2.3
-            Assert-Throws { Get-CsrunPublishedEngine fork/csrun $destination v1.2.4 } 'differs from the authoritative'
+            & $AssertThrows { Get-CsrunPublishedEngine fork/csrun $destination v1.2.4 } 'differs from the authoritative'
             foreach ($tag in @('', 'v01.2.3', 'v1.2.3-rc.1')) {
                 $script:release.tag_name = $tag
-                Assert-Throws { Get-CsrunPublishedEngine fork/csrun $destination '' } 'verifiable'
+                & $AssertThrows { Get-CsrunPublishedEngine fork/csrun $destination '' } 'verifiable'
             }
             $script:release.tag_name = 'v1.2.3'
             $script:release.assets[0].digest = 'sha256:' + ('0' * 64)
-            Assert-Throws { Get-CsrunPublishedEngine fork/csrun $destination '' } 'integrity'
+            & $AssertThrows { Get-CsrunPublishedEngine fork/csrun $destination '' } 'integrity'
         } finally {
             Remove-Item Function:Invoke-RestMethod, Function:Invoke-WebRequest
             if (Test-Path -LiteralPath $destination) { Remove-Item -LiteralPath $destination }
             Remove-Variable release -Scope Script
         }
-    }
+    } ${function:Assert-Throws}
 }
 Write-Host "BuildAndPublish tests: $passed passed, $failed failed"
 exit ([int]($failed -gt 0))
