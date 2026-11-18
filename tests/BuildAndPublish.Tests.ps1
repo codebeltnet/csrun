@@ -20,6 +20,30 @@ Test-Case 'SDK-specific tags and PassThru with WhatIf' {
         $actual = @($plan.Tags | ForEach-Object { ($_ -split ':')[-1] })
         if (@(Compare-Object $actual $case.Tags).Count -or $plan.Published -or $plan.EngineVersion -or $plan.BaseImage) { throw 'Invalid dry-run plan, or WhatIf resolved external state.' }
         if ($plan.Repository -cne 'docker.io/codebeltnet/' -or $plan.Dockerfile -cne './csrun.Dockerfile') { throw 'Unexpected defaults.' }
+        if ($plan.VersionedTags.Count -ne 0 -or $plan.UnresolvedVersionedTags.Count -ne 3) { throw 'Missing unresolved release aliases.' }
+        $known = BuildAndPublish -SdkVersion $case.Versions -EngineVersion v0.2.2 -WhatIf -PassThru
+        $expected = @($case.Tags) + @($case.Tags | ForEach-Object { "$_-v0.2.2" })
+        if (($known.Tags -join ',') -cne (($expected | ForEach-Object { "docker.io/codebeltnet/csrun:$_" }) -join ',') -or $known.VersionedTags.Count -ne 3 -or $known.ConvenienceTags.Count -ne 3 -or $known.UnresolvedVersionedTags.Count) { throw 'Release tagging matrix differs.' }
+    }
+}
+Test-Case 'release identities and Docker length limits are validated without side effects' {
+    foreach ($version in @('', '0.2.2','v01.2.3','v1.2.3-rc.1','latest','v1.2')) {
+        Assert-Throws { BuildAndPublish 10.0.404 -EngineVersion $version -WhatIf } 'Engine release'
+    }
+    Assert-Throws { BuildAndPublish 10.0.404 -EnginePath ./csrun.ps1 -WhatIf } 'explicit release'
+    $sdk = '11.0.100-' + ('a' * 119)
+    $null = BuildAndPublish $sdk -WhatIf -PassThru
+    Assert-Throws { BuildAndPublish $sdk -EngineVersion v0.2.2 -WhatIf } 'overlong'
+    & $module {
+        function Invoke-RestMethod { throw 'Network forbidden.' }
+        function Invoke-WebRequest { throw 'Network forbidden.' }
+        function docker { throw 'Docker forbidden.' }
+        function python { throw 'Python forbidden.' }
+        try {
+            $plan = BuildAndPublish 11.0.100-rc.1.26425.128 -EnginePath missing.ps1 -EngineVersion v0.2.2 -BuildOnly -Registry localhost:5000/fork -EngineRepository fork/csrun -WhatIf -PassThru
+            if ($plan.VersionedTags[0] -cne 'localhost:5000/fork/csrun:11.0.100-rc.1-v0.2.2') { throw 'Prerelease or custom destination changed.' }
+            $null = BuildAndPublish 10.0.404 -WhatIf -PassThru
+        } finally { Remove-Item Function:Invoke-RestMethod, Function:Invoke-WebRequest, Function:docker, Function:python }
     }
 }
 Test-Case 'reference prerelease normalization preserves exact SDK input' {
@@ -106,6 +130,34 @@ Test-Case 'exact historical SDK lookup uses channel metadata without substitutio
             if (-not $rejected) { throw 'Unknown exact SDK was accepted.' }
         } finally { Remove-Item Function:Invoke-RestMethod }
     }
+}
+Test-Case 'downloaded fork release is authoritative and explicit versions must match' {
+    & $module {
+        param([scriptblock] $AssertThrows)
+        $destination = Join-Path ([IO.Path]::GetTempPath()) ('csrun-engine-test-' + [guid]::NewGuid().ToString('N'))
+        $script:release = @{id=123; draft=$false; prerelease=$false; tag_name='v1.2.3'; assets=@(@{name='csrun.ps1'; digest='sha256:6f5237ab16b004222196b68b22fbca3273d5803611518e1b3f2bcb303e0ab7637'; size=6})}
+        function Invoke-RestMethod { param($Uri) if ($Uri -cne 'https://api.github.com/repos/fork/csrun/releases/latest') { throw 'Unexpected repository.' }; $script:release }
+        function Invoke-WebRequest { param($Uri, $OutFile) if ($Uri -cne 'https://github.com/fork/csrun/releases/latest/download/csrun.ps1') { throw 'Unexpected download.' }; [IO.File]::WriteAllText($OutFile, 'engine') }
+        try {
+            # Use a fixture hash computed independently from the acquisition path.
+            $script:release.assets[0].digest = 'sha256:' + [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData([Text.Encoding]::UTF8.GetBytes('engine'))).ToLowerInvariant()
+            $actual = Get-CsrunPublishedEngine fork/csrun $destination ''
+            if ($actual.Release.tag_name -cne 'v1.2.3') { throw 'Lost authoritative engine identity.' }
+            $null = Get-CsrunPublishedEngine fork/csrun $destination v1.2.3
+            & $AssertThrows { Get-CsrunPublishedEngine fork/csrun $destination v1.2.4 } 'differs from the authoritative'
+            foreach ($tag in @('', 'v01.2.3', 'v1.2.3-rc.1')) {
+                $script:release.tag_name = $tag
+                & $AssertThrows { Get-CsrunPublishedEngine fork/csrun $destination '' } 'verifiable'
+            }
+            $script:release.tag_name = 'v1.2.3'
+            $script:release.assets[0].digest = 'sha256:' + ('0' * 64)
+            & $AssertThrows { Get-CsrunPublishedEngine fork/csrun $destination '' } 'integrity'
+        } finally {
+            Remove-Item Function:Invoke-RestMethod, Function:Invoke-WebRequest
+            if (Test-Path -LiteralPath $destination) { Remove-Item -LiteralPath $destination }
+            Remove-Variable release -Scope Script
+        }
+    } ${function:Assert-Throws}
 }
 Write-Host "BuildAndPublish tests: $passed passed, $failed failed"
 exit ([int]($failed -gt 0))

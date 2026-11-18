@@ -98,15 +98,4 @@ jobs:
           export REGISTRY_AUTH_FILE="$RUNNER_TEMP/csrun-auth.json"
           trap 'rm -f "$REGISTRY_AUTH_FILE"' EXIT
           printf '%s' "$DOCKERHUB_TOKEN" | skopeo login --authfile "$REGISTRY_AUTH_FILE" --username "$DOCKERHUB_USERNAME" --password-stdin docker.io
-          status=0
-          for sdk in 10 11 10-11; do
-            echo "::group::Promote SDK $sdk"
-            if python tools/release-images.py restore "$sdk" && python tools/release-images.py publish; then
-              echo "SDK $sdk promotion succeeded."
-            else
-              echo "::error::SDK $sdk promotion failed."
-              status=1
-            fi
-            echo "::endgroup::"
-          done
-          exit "$status"
+          python tools/release-images.py publish-all

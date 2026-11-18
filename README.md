@@ -144,17 +144,20 @@ BuildAndPublish 11.0.100
 BuildAndPublish 10.0.404 11.0.100
 ```
 
-| Exact SDK inputs | Published SDK environment tags |
+| Exact SDK inputs | Convenience SDK environment tags |
 | --- | --- |
 | `10.0.404` | `10.0.404`, `10.0`, `10` |
 | `11.0.100` | `11.0.100`, `11.0`, `11` |
 | `10.0.404 11.0.100` | `10.0.404-11.0.100`, `10.0-11.0`, `10-11` |
 
-No additional aliases are generated. Input order determines tag order. Full prerelease SDK versions remain exact installation inputs; release-build suffixes normalize for image tags using the Ubuntu Test Runner convention (for example, `11.0.100-rc.1.26425.128` becomes `11.0.100-rc.1`). Duplicate major, major.minor or normalized publish tags are rejected before Docker runs. Only supported .NET 10+ GA channels and the latest explicitly requested preview/go-live channel are accepted. Exact SDK availability is checked in Microsoft's per-channel release metadata, not inferred from the release index's latest patch.
+Each convenience alias also receives a release-versioned alias by appending the verified csrun release, as described in [Docker image versioning](#docker-image-versioning). Input order determines tag order. Full prerelease SDK versions remain exact installation inputs; release-build suffixes normalize for image tags using the Ubuntu Test Runner convention (for example, `11.0.100-rc.1.26425.128` becomes `11.0.100-rc.1`). Duplicate major, major.minor or normalized publish tags and Docker tags exceeding 128 characters are rejected before Docker runs when the release version is known, or before image construction once it is resolved. Only supported .NET 10+ GA channels and the latest explicitly requested preview/go-live channel are accepted. Exact SDK availability is checked in Microsoft's per-channel release metadata, not inferred from the release index's latest patch.
 
 ```powershell
 # Plan only: no downloads, build, tests, or publication
 BuildAndPublish 10.0.404 11.0.100 -WhatIf -PassThru
+
+# Include both tag families in the offline plan
+BuildAndPublish 10.0.404 11.0.100 -EngineVersion v0.2.2 -WhatIf -PassThru
 
 # Local build and full container validation, with no registry writes
 BuildAndPublish 10.0.404 -BuildOnly -PassThru -MetadataFile ./artifacts/10.json
@@ -190,6 +193,66 @@ The default engine source remains the verified canonical latest Codebelt GitHub 
 The newest requested SDK supplies the official Ubuntu base (verified Resolute or Noble tag, pinned to a digest). Its SDK and PowerShell are retained. Additional SDK archives come from Microsoft's exact release metadata, are checked against SHA-512, and install side by side without overwriting existing host files, runtimes or packs. Both NETCore and ASP.NET Core runtimes and the official image's Git remain available. No debugger or unrelated development packages are added.
 
 Single-SDK images minimize download and local storage for one environment. Combined images add the explicitly requested SDK, runtimes and targeting packs, offering both TFMs at a larger size. See [container validation results](docs/container-validation.md) for measured local sizes and validation limits.
+
+### Docker image versioning
+
+Docker tags select an SDK environment and, optionally, a csrun release. These examples illustrate the naming contract; they do not assert that the tags are currently published:
+
+```powershell
+# Convenience: follows the current published environment
+docker pull codebeltnet/csrun:10
+
+# Explicit csrun release: stable published image
+docker pull codebeltnet/csrun:10-v0.2.2
+
+# Exact SDK environment and csrun release
+docker pull codebeltnet/csrun:10.0.404-v0.2.2
+```
+
+For SDK inputs `10.0.404` and `11.0.100` and verified csrun release `v0.2.2`, the planner produces:
+
+| SDK environment | Convenience aliases | Release-versioned aliases |
+|---|---|---|
+| .NET 10 | `10.0.404`, `10.0`, `10` | `10.0.404-v0.2.2`, `10.0-v0.2.2`, `10-v0.2.2` |
+| .NET 11 | `11.0.100`, `11.0`, `11` | `11.0.100-v0.2.2`, `11.0-v0.2.2`, `11-v0.2.2` |
+| Combined | `10.0.404-11.0.100`, `10.0-11.0`, `10-11` | `10.0.404-11.0.100-v0.2.2`, `10.0-11.0-v0.2.2`, `10-11-v0.2.2` |
+
+Existing convenience aliases remain movable and select the most recently published csrun release for that environment. The actual SDK/runtime inventory is determined by the image. Pulling an update may introduce new functionality, changed defaults or execution behavior, breaking API or manifest-contract changes, SDK/runtime patches, and security or maintenance updates. Convenience tags carry no backward-compatibility promise. Previously downloaded images remain cached until explicitly updated or removed.
+
+Release-versioned aliases preserve the originally published image for that csrun release and SDK environment. They must never intentionally be reassigned to different content. They do not automatically receive future security fixes or SDK patches: upstream SDK changes require a new verified csrun release/image publication. All six aliases for an environment reference one verified OCI index, without rebuilding or changing layers. No standalone csrun-version tag, Docker `latest`, `stable`, `current`, or `preview` alias is added.
+
+| Version | Responsibility |
+|---|---|
+| csrun release | Tool behavior, compatibility, and release identity |
+| .NET SDK | Compiler, runtime, and SDK environment |
+| Manifest `schemaVersion` | JSON manifest structure and semantics |
+
+A release-specific Docker tag does not guarantee compatibility with every manifest schema; compatibility is defined by that csrun release's contract. Manifest schema version 1 and the native script reference `releases/latest/download/csrun.ps1` remain unchanged. The canonical native download is intentionally independent of Docker tagging.
+
+For byte-for-byte immutable selection, pin the published OCI index digest, for example `docker pull codebeltnet/csrun@sha256:<published-index-digest>`. A versioned tag is stable by publishing policy; its `sha256` digest identifies immutable content.
+
+Before publication, the shared OCI publisher inspects every release-versioned destination. An absent tag permits publication; an identical index digest is an idempotent retry; different content fails explicitly without overwriting. Authentication, connectivity and unrecognized registry failures fail closed. Versioned aliases are published and verified before convenience aliases move, including a preflight across all CI SDK variants. Each destination's raw index digest must match the saved artifact, and registry content is downloaded by digest to reverify child manifests, blobs, SBOM and provenance. Interrupted promotion can be retried with the original release artifacts; a stale release cannot update current convenience aliases.
+
+Client-side checks cannot make the registry check/write sequence atomic against concurrent or external writes. Enable registry-enforced immutability for release-versioned aliases wherever available, while leaving convenience aliases movable. [Docker Hub supports selective immutable-tag rules](https://docs.docker.com/docker-hub/repos/manage/hub-images/immutable-tags/), for example the RE2 pattern `^.+-v[0-9]+\.[0-9]+\.[0-9]+$`. This is an administrator setting; the workflows do not enable it. Restrict other writers as well. Post-push verification detects changes but cannot prevent an external writer from changing a mutable tag afterward.
+
+Fork maintainers use the same module and policy with their own registry, native contexts/builders and engine release repository. The default acquisition path derives the version from the verified published GitHub Release; an explicit `-EngineVersion` must match it. A local `-EnginePath` requires a validated `-EngineVersion vMAJOR.MINOR.PATCH`. Release-workflow builds use the authoritative Git tag. No Codebelt secrets, environments or CI artifacts are required for manual publishing.
+
+After a partial manual publication, retain the merged local OCI archive, its `.sha256` seal and the build metadata. Retry promotion of those exact bytes through the shared publisher instead of rebuilding the same release. For a two-platform archive, after confirming that this is still the latest published engine release in your configured engine repository (or the current release under your local-engine publishing policy):
+
+```powershell
+$record = Get-Content ./artifacts/csrun-image.json -Raw | ConvertFrom-Json
+python ./tools/oci.py publish ./artifacts/csrun.oci.tar `
+    --version $record.EngineVersion --revision $record.SourceCommit `
+    --engine $record.EngineSha256 --source $record.SourceRepository `
+    --tags @($record.Tags) --versioned-tags @($record.VersionedTags)
+if ($LASTEXITCODE -ne 0) { throw 'OCI recovery failed.' }
+```
+
+For a deliberately single-platform fork archive, also supply `--platform amd64` or `--platform arm64` to match the saved native result. The publisher revalidates the archive, seal and registry content; conflicting release-versioned tags still fail. A fresh build may produce a different index even with identical SDK inputs and therefore cannot replace an already published release-versioned image.
+
+`-WhatIf -PassThru` performs no network access or build. With an explicit engine version, `Tags` contains the three original convenience aliases followed by their three versioned aliases; `ConvenienceTags` and `VersionedTags` expose each family. Without an engine version, `Tags` retains the original convenience aliases, `VersionedTags` is empty, and `UnresolvedVersionedTags` shows `<verified-release-version>` placeholders. These placeholders are planning metadata, never publishable tags.
+
+This contract is additive. Historical release metadata retains its original convenience-only recovery policy; recovery does not invent historical versioned aliases. Never synthesize historical aliases from rebuilt content. Older saved OCI artifacts may permit a separately approved backfill only after their original identity and native verification evidence have been revalidated.
 
 ## Validation and releases
 
@@ -227,7 +290,7 @@ Release delivery follows these stages:
 2. Assembly combines the unchanged AMD64/ARM64 manifests and attestations into one index per SDK environment. `codebeltnet/oci-artifact-verify@v1` checks the checksum, released source identity and multi-platform contract; csrun also validates all blobs, config labels, native result records, SBOM and provenance. No layers are rebuilt.
 3. The established release job creates a **draft GitHub Release** containing the tested standalone engine, its checksum, release records and tested OCI artifacts. Archives are split into 1 GiB assets to stay below GitHub's per-file limit. Large Actions artifacts have one-day retention and are deleted after successful durable release attachment; deployment recovery uses GitHub Release assets. PR jobs upload small JSON records rather than image archives. Expect several GiB of temporary release-run storage across six native builds and assembly; assembly is divided by SDK variant to limit runner disk use. The draft-creation job alone has Actions write permission to delete these transient copies.
 4. After review and explicit approval, publish the draft as the latest GitHub Release. `deploy.yml` resolves `releases/latest/download/csrun.ps1` **once**, verifies GitHub's asset digest/size and release ID, and requires that release to match the deployment request. It verifies tag ancestry on main, the successful authoritative tag release run, both native results and the saved image engine checksum. Consequently the image built before publication must contain byte-identical released engine content. No build occurs after publication or during deployment.
-5. One approval of the separate `Production` environment job covers all three SDK variants (`10`, `11`, `10-11`). The job promotes them sequentially, attempts every variant even if one fails, and fails overall if any promotion fails. It promotes each existing OCI index to `docker.io/codebeltnet/csrun`, preserving all platform and attestation manifests. SDK patch, major.minor and major aliases reference the same content. There is **no Docker `latest` tag**, JCR or GHCR destination. Promotion fails if Skopeo cannot preserve child digests. CD inspects each registry index, downloads the published content by immutable digest, and validates its platforms, blobs, SBOM and provenance again. Workflow summaries contain tags, final index digest, both native results, exact SDK inventories, sizes, GitHub Release, source commit and engine checksum.
+5. One approval of the separate `Production` environment job covers all three SDK variants (`10`, `11`, `10-11`). The job restores and preflights every variant before any publication, promotes and verifies all release-versioned aliases, then updates convenience aliases. It stops on failure; retry reuses the same saved bytes and accepts already matching versioned aliases. It promotes each existing OCI index to `docker.io/codebeltnet/csrun`, preserving all platform and attestation manifests. Both tag families reference the same content per SDK environment. There is **no Docker `latest` tag**, JCR or GHCR destination. Promotion fails if Skopeo cannot preserve index or child digests. CD inspects each registry index, downloads the published content by immutable digest, and validates its platforms, blobs, SBOM and provenance again. Workflow summaries contain both tag families, final index digest, both native results, exact SDK inventories, sizes, GitHub Release, source commit and engine checksum.
 
 Configure the `Production` GitHub environment with required reviewers and restricted deployment refs **before enabling publication**. Store a Docker Hub account name in `DOCKERHUB_USERNAME` and a repository-scoped access token in `DOCKERHUB_TOKEN` as environment secrets. Only the publishing step receives these secrets; authentication uses stdin and a temporary auth file removed on exit. PRs, release preparation and artifact verification never receive Docker Hub credentials. Repository environment protection and branch required checks are administrator settings; adding workflow YAML does not configure them.
 
