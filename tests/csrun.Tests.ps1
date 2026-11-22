@@ -1,4 +1,4 @@
-#requires -Version 7.0
+﻿#requires -Version 7.0
 [CmdletBinding()]
 param(
     [switch] $CompatibilityOnly,
@@ -125,9 +125,15 @@ try {
         foreach ($tfm in @('net10.0', 'net11.0', 'net11.0-windows10.0.19041.0', 'net13.0')) {
             if ((Resolve-Framework $tfm $fixture) -cne $tfm) { throw "Changed explicit TFM $tfm" }
         }
-        foreach ($tfm in @('net9.0','net12.0','net99.0','win-x64')) {
+        foreach ($tfm in @('net471', 'net472', 'net48', 'net481')) {
+            if ((Resolve-Framework $tfm $fixture $true) -cne $tfm) { throw "Changed explicit .NET Framework TFM $tfm" }
             $rejected = $false
-            try { $null = Resolve-Framework $tfm $fixture } catch { $rejected = $true }
+            try { $null = Resolve-Framework $tfm $fixture $false } catch { $rejected = ($_.Exception.Message -match 'only supported natively on Windows') }
+            if (-not $rejected) { throw "Accepted .NET Framework TFM $tfm on non-Windows" }
+        }
+        foreach ($tfm in @('net9.0','net12.0','net99.0','win-x64','netstandard2.0','net45','net46','net461','net462','net47','net482','net48-windows')) {
+            $rejected = $false
+            try { $null = Resolve-Framework $tfm $fixture $true } catch { $rejected = $true }
             if (-not $rejected) { throw "Accepted $tfm" }
         }
         $goLive = @($fixture | ForEach-Object { $_.Clone() })
@@ -241,6 +247,74 @@ try {
             $result = Invoke-Runner @{ManifestJson=($m | ConvertTo-Json)} -NormalBuildServers
             Assert-Result $result $case.Code $case.Pattern
             Assert-TestArtifactsRemoved $result
+        }
+    }
+    Test-Case 'non-Windows runner rejects .NET Framework TFM fail-fast' {
+        $nonWindowsRunner = Join-Path $root 'non-windows-runner.ps1'
+        $nonWindowsText = $runnerText.Replace('[bool] $WindowsPlatform = $IsWindows', '[bool] $WindowsPlatform = $false')
+        if ($nonWindowsText -ceq $runnerText) { throw 'Could not simulate non-Windows platform.' }
+        [IO.File]::WriteAllText($nonWindowsRunner, $nonWindowsText)
+        $oldRunner = $script:runner
+        try {
+            $script:runner = $nonWindowsRunner
+            Assert-Result (Invoke-Runner @{Framework='net48'; Source='System.Console.WriteLine(1);'}) 1 'only supported natively on Windows'
+        } finally { $script:runner = $oldRunner }
+    }
+    if ($IsWindows) {
+        Test-Case 'net48 console resolves lib/netstandard2.0 package asset and preserves exit status' {
+            $source = @'
+using System;
+using System.Reflection;
+using System.Runtime.InteropServices;
+using System.Runtime.Versioning;
+using Cuemon;
+var tfm = typeof(DateSpan).Assembly.GetCustomAttribute<TargetFrameworkAttribute>()?.FrameworkName;
+Console.WriteLine("RUNTIME:" + RuntimeInformation.FrameworkDescription);
+Console.WriteLine("ASSET_TFM:" + tfm);
+Console.WriteLine("DAYS:" + new DateSpan(new DateTime(2018, 1, 1), new DateTime(2018, 10, 1)).TotalDays);
+Console.Error.WriteLine("net48 stderr");
+return 23;
+'@
+            $m = New-Manifest $source console @('Cuemon.Kernel@11.0.0')
+            $m.framework = 'net48'
+            $result = Invoke-Manifest $m
+            Assert-Result $result 23 '(?s)RUNTIME:\.NET Framework.*ASSET_TFM:\.NETStandard,Version=v2\.0.*DAYS:273'
+            if ($result.Err -notmatch 'net48 stderr') { throw 'Child stderr was lost on net48.' }
+            if (@(Get-ChildItem -LiteralPath $root -Directory -Filter 'csrun-*').Count) { throw 'Leaked net48 console project artifacts.' }
+        }
+        Test-Case 'net48 test mode runs xUnit v3 against lib/netstandard2.0 asset and preserves MTP exit codes' {
+            $source = @'
+using System.Reflection;
+using System.Runtime.InteropServices;
+using System.Runtime.Versioning;
+using Cuemon;
+using Xunit;
+public class Net48Tests {
+    [Fact]
+    public void ResolvesNetStandard20AssetOnNetFramework() {
+        Assert.Contains(".NET Framework", RuntimeInformation.FrameworkDescription);
+        Assert.Equal(".NETStandard,Version=v2.0", typeof(DateSpan).Assembly.GetCustomAttribute<TargetFrameworkAttribute>()?.FrameworkName);
+    }
+}
+'@
+            $m = New-Manifest $source test @('Cuemon.Kernel@11.0.0')
+            $m.framework = 'net48'
+            $result = Invoke-Manifest $m
+            Assert-Result $result 0 '(?s)total: 1.*failed: 0.*succeeded: 1'
+            Assert-TestArtifactsRemoved $result
+            $failing = New-Manifest 'using Xunit; public class T { [Fact] public void Fail() { Assert.Equal(1, 2); } }' test
+            $failing.framework = 'net48'
+            $failResult = Invoke-Manifest $failing
+            Assert-Result $failResult 2 'Assert.Equal\(\) Failure'
+            Assert-TestArtifactsRemoved $failResult
+        }
+        Test-Case 'net48 console supports matching preamble directives and rejects conflicts' {
+            $m = New-Manifest "#:property TargetFramework=net48`n#:sdk Microsoft.NET.Sdk`nSystem.Console.WriteLine(42);"
+            $m.framework = 'net48'
+            Assert-Result (Invoke-Manifest $m) 0 '(?m)^42\r?$'
+            $bad = New-Manifest "#:property TargetFramework=net472`nSystem.Console.WriteLine(42);"
+            $bad.framework = 'net48'
+            Assert-Result (Invoke-Manifest $bad) 1 'conflicts'
         }
     }
     if (-not $CompatibilityOnly) {
@@ -426,6 +500,12 @@ public class Tests {
         @{Name='noninteger schema'; Field='schemaVersion'; Value=1.0; Pattern='schemaVersion'},
         @{Name='method mode'; Field='mode'; Value='method'; Pattern='Unsupported mode'},
         @{Name='bad TFM'; Field='framework'; Value='win-x64'; Pattern='Invalid framework'},
+        @{Name='netstandard2.0 TFM'; Field='framework'; Value='netstandard2.0'; Pattern='Invalid framework'},
+        @{Name='unsupported net45 TFM'; Field='framework'; Value='net45'; Pattern='Invalid framework'},
+        @{Name='unsupported net462 TFM'; Field='framework'; Value='net462'; Pattern='Invalid framework'},
+        @{Name='unsupported net47 TFM'; Field='framework'; Value='net47'; Pattern='Invalid framework'},
+        @{Name='unsupported net482 TFM'; Field='framework'; Value='net482'; Pattern='Invalid framework'},
+        @{Name='invalid net48-windows TFM'; Field='framework'; Value='net48-windows'; Pattern='Invalid framework'},
         @{Name='null framework'; Field='framework'; Value=$null; Pattern='Invalid framework'},
         @{Name='empty framework array'; Field='framework'; Value=@(); Pattern='Invalid framework'},
         @{Name='single-item framework array'; Field='framework'; Value=@('net10.0'); Pattern='Invalid framework'},
