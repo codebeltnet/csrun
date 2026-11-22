@@ -316,6 +316,17 @@ public class Net48Tests {
             $bad.framework = 'net48'
             Assert-Result (Invoke-Manifest $bad) 1 'conflicts'
         }
+        Test-Case 'net48 console preserves closing block comment on directive line' {
+            $m = New-Manifest "/* header`n*/ #:sdk Microsoft.NET.Sdk`nSystem.Console.WriteLine(42);`n"
+            $m.framework = 'net48'
+            Assert-Result (Invoke-Manifest $m) 0 '(?m)^42\r?$'
+        }
+        Test-Case 'net48 console preserves CRLF line endings when stripping directives' {
+            $source = "#:sdk Microsoft.NET.Sdk`r`nvar s = @`"a`r`nb`";`r`nSystem.Console.WriteLine(s.Contains(`"\r\n`"));`r`n"
+            $m = New-Manifest $source
+            $m.framework = 'net48'
+            Assert-Result (Invoke-Manifest $m) 0 '(?m)^True\r?$'
+        }
     }
     if (-not $CompatibilityOnly) {
     Test-Case 'inline console and no user project' {
