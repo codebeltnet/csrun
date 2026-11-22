@@ -6,8 +6,10 @@ Runs a complete trusted C# console program or genuine xUnit v3 tests.
 .DESCRIPTION
 Accepts a schemaVersion 1 JSON manifest, or direct options normalized to the
 same manifest. Requires an installed .NET 10+ SDK and the requested runtime.
-The framework defaults to the latest supported GA LTS channel. Explicit targets
-are checked against the official release index, cached for up to 12 hours.
+The framework defaults to the latest supported GA LTS channel. Explicit
+modern .NET targets are checked against the official release index, cached for
+up to 12 hours. Legacy .NET Framework targets (net471, net472, net48, net481)
+are supported natively on Windows only.
 Scriptblock callers can inspect $LASTEXITCODE without leaving their session;
 pwsh -File returns that status to the calling process.
 Executes code and package build assets with your permissions; this is not a sandbox.
@@ -17,7 +19,9 @@ framework, dependsOn, sdk and frameworkReferences fields. Exclusive with direct 
 .PARAMETER Mode
 console (default) or test.
 .PARAMETER Framework
-Target framework; defaults to the latest supported LTS channel.
+Target framework; defaults to the latest supported LTS channel. Accepts .NET 10+
+TFMs (for example net10.0 or net10.0-windows) and Windows-only .NET Framework
+TFMs (net471, net472, net48, net481).
 .PARAMETER DependsOn
 Explicit PackageId@ExactVersion pins. No floating versions or discovery.
 .PARAMETER Source
@@ -88,14 +92,18 @@ function Get-ReleaseIndex {
     return ,$index['releases-index']
 }
 
-function Resolve-Framework($Framework, $Index) {
+function Resolve-Framework($Framework, $Index, [bool] $WindowsPlatform = $IsWindows) {
+    if ($Framework -is [string] -and $Framework -cmatch '^net4(7[12]|8|81)$') {
+        if (-not $WindowsPlatform) { throw "Framework '$Framework' targets .NET Framework and is only supported natively on Windows." }
+        return $Framework
+    }
     $channels = @($Index | Where-Object { $_.product -eq '.NET' -and $_['channel-version'] -match '^\d+\.\d+$' -and [version]$_['channel-version'] -ge [version]'10.0' } | Sort-Object { [version]$_['channel-version'] } -Descending)
     if ($null -eq $Framework) {
         $lts = @($channels | Where-Object { $_['release-type'] -eq 'lts' -and $_['support-phase'] -in @('active', 'maintenance') -and $_['latest-release'] -match '^\d+\.\d+\.\d+$' }) | Select-Object -First 1
         if (-not $lts) { throw 'The release index contains no supported GA LTS channel.' }
-        return Resolve-Framework "net$($lts['channel-version'])" $Index
+        return Resolve-Framework "net$($lts['channel-version'])" $Index $WindowsPlatform
     }
-    if ($Framework -isnot [string] -or $Framework -cnotmatch '^net(?<channel>[1-9][0-9]*\.[0-9]+)(?:-(?:windows|linux|macos|android|ios|maccatalyst|tvos|browser)(?:[0-9]+(?:\.[0-9]+){0,3})?)?$') { throw 'Invalid framework; supply a .NET target framework such as net10.0 or net10.0-windows.' }
+    if ($Framework -isnot [string] -or $Framework -cnotmatch '^net(?<channel>[1-9][0-9]*\.[0-9]+)(?:-(?:windows|linux|macos|android|ios|maccatalyst|tvos|browser)(?:[0-9]+(?:\.[0-9]+){0,3})?)?$') { throw 'Invalid framework; supply a .NET target framework such as net10.0, net10.0-windows, or net48 (Windows only).' }
     $channel = $Matches.channel
     $entry = @($channels | Where-Object { $_['channel-version'] -ceq $channel })
     if ($entry.Count -ne 1) { throw "Framework '$Framework' has no unique channel in the official .NET release index." }
@@ -164,28 +172,55 @@ function Get-ValidatedManifest($InputManifest) {
     return @{ Mode = $executionMode; Framework = $framework; Source = $InputManifest.source; Sdk = $sdk; Pins = $pins; References = $refs }
 }
 
-function Get-ConsoleSource($Manifest) {
+function Get-ConsoleSource($Manifest, [switch] $StripDirectives) {
     $directives = [ordered]@{ 'property TargetFramework' = $Manifest.Framework; 'sdk' = $Manifest.Sdk }
     $seen = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
     foreach ($id in $Manifest.Pins.Keys) { $directives["package $id"] = $Manifest.Pins[$id] }
     # Inspect only the directive preamble, never C# declarations or method bodies.
     # Original source is appended byte-for-character, including existing directives.
+    $source = $Manifest.Source
     $inBlockComment = $false
-    foreach ($line in ($Manifest.Source -split '\r\n|\n|\r')) {
-        $text = $line.Trim()
-        # Skip leading comments only; do not scan strings or the C# program body.
-        while ($text.Length -gt 0) {
-            if ($inBlockComment) {
-                $end = $text.IndexOf('*/', [StringComparison]::Ordinal)
-                if ($end -lt 0) { $text = ''; break }
-                $text = $text.Substring($end + 2).TrimStart(); $inBlockComment = $false
-            } elseif ($text.StartsWith('/*')) { $inBlockComment = $true; $text = $text.Substring(2) }
-            else { break }
+    $removals = [System.Collections.Generic.List[hashtable]]::new()
+    $pos = 0
+    while ($pos -lt $source.Length) {
+        $eolStart = $source.IndexOfAny([char[]]@("`r", "`n"), $pos)
+        if ($eolStart -lt 0) {
+            $lineEnd = $source.Length
+            $nextPos = $source.Length
+        } else {
+            $lineEnd = $eolStart
+            $nextPos = if ($source[$eolStart] -eq "`r" -and ($eolStart + 1) -lt $source.Length -and $source[$eolStart + 1] -eq "`n") { $eolStart + 2 } else { $eolStart + 1 }
         }
-        if ($text.Length -eq 0 -or $text.StartsWith('//')) { continue }
+        $line = $source.Substring($pos, $lineEnd - $pos)
+        $offset = 0
+        $commentEnd = 0
+        $hasPrefixComment = $false
+        # Skip leading comments only; do not scan strings or the C# program body.
+        while ($offset -lt $line.Length) {
+            if ($inBlockComment) {
+                $end = $line.IndexOf('*/', $offset, [StringComparison]::Ordinal)
+                if ($end -lt 0) { $offset = $line.Length; break }
+                $offset = $end + 2
+                $commentEnd = $offset
+                $inBlockComment = $false
+                $hasPrefixComment = $true
+            } else {
+                while ($offset -lt $line.Length -and [char]::IsWhiteSpace($line[$offset])) { $offset++ }
+                if ($offset -ge $line.Length) { break }
+                if (($offset + 1) -lt $line.Length -and $line[$offset] -eq '/' -and $line[$offset + 1] -eq '*') {
+                    $inBlockComment = $true
+                    $offset += 2
+                    $hasPrefixComment = $true
+                } else {
+                    break
+                }
+            }
+        }
+        $text = $line.Substring($offset).TrimEnd()
+        if ($text.Length -eq 0 -or $text.StartsWith('//')) { $pos = $nextPos; continue }
         # C# preprocessor directives such as #nullable do not end the SDK's
         # directive preamble. Leave them untouched, but validate following #: lines.
-        if ($text.StartsWith('#') -and -not $text.StartsWith('#:')) { continue }
+        if ($text.StartsWith('#') -and -not $text.StartsWith('#:')) { $pos = $nextPos; continue }
         if (-not $text.StartsWith('#:')) { break }
         $key = $null
         $value = $null
@@ -199,6 +234,23 @@ function Get-ConsoleSource($Manifest) {
         if ($seen.Contains($key)) { throw "Duplicate source directive '$text'; the SDK requires one occurrence per setting." }
         # A matching directive in the original source supplies this setting.
         $null = $seen.Add($key)
+        if ($hasPrefixComment) {
+            $removals.Add(@{ Start = $pos + $commentEnd; End = $lineEnd })
+        } else {
+            $removals.Add(@{ Start = $pos; End = $nextPos })
+        }
+        $pos = $nextPos
+    }
+    if ($StripDirectives) {
+        if ($removals.Count -eq 0) { return $source }
+        $builder = [System.Text.StringBuilder]::new($source.Length)
+        $cursor = 0
+        foreach ($span in $removals) {
+            $null = $builder.Append($source, $cursor, $span.Start - $cursor)
+            $cursor = $span.End
+        }
+        $null = $builder.Append($source, $cursor, $source.Length - $cursor)
+        return $builder.ToString()
     }
     $preamble = foreach ($key in $directives.Keys) {
         if ($seen.Contains($key)) { continue }
@@ -210,7 +262,7 @@ function Get-ConsoleSource($Manifest) {
     return ($preamble -join "`n") + "`n#:property WarningsAsErrors=NU1603;NU1605`n" + $Manifest.Source
 }
 
-function Write-TestProject($Manifest, [string] $Directory) {
+function Write-Project($Manifest, [string] $Directory, [bool] $IsNetFramework = $false, $SourceOverride = $null) {
     $project = Join-Path $Directory 'Sample.csproj'
     $settings = [System.Xml.XmlWriterSettings]::new()
     $settings.Indent = $true
@@ -218,8 +270,11 @@ function Write-TestProject($Manifest, [string] $Directory) {
     try {
         $writer.WriteStartElement('Project'); $writer.WriteAttributeString('Sdk', $Manifest.Sdk)
         $writer.WriteStartElement('PropertyGroup')
-        foreach ($pair in @{ OutputType = 'Exe'; TargetFramework = $Manifest.Framework; UseMicrosoftTestingPlatformRunner = 'true'; ImplicitUsings = 'enable'; Nullable = 'enable' }.GetEnumerator()) {
-            $writer.WriteElementString($pair.Key, $pair.Value)
+        $properties = [ordered]@{ OutputType = 'Exe'; TargetFramework = $Manifest.Framework; ImplicitUsings = 'enable'; Nullable = 'enable'; WarningsAsErrors = 'NU1603;NU1605' }
+        if ($IsNetFramework) { $properties['LangVersion'] = 'latest' }
+        if ($Manifest.Mode -eq 'test') { $properties['UseMicrosoftTestingPlatformRunner'] = 'true' }
+        foreach ($key in $properties.Keys) {
+            $writer.WriteElementString($key, $properties[$key])
         }
         $writer.WriteEndElement()
         $writer.WriteStartElement('ItemGroup')
@@ -228,13 +283,21 @@ function Write-TestProject($Manifest, [string] $Directory) {
             # NuGet bracket syntax enforces an exact version rather than a lower bound.
             $writer.WriteAttributeString('Version', "[$($Manifest.Pins[$id])]"); $writer.WriteEndElement()
         }
+        if ($IsNetFramework -and -not $Manifest.Pins.Contains('Microsoft.NETFramework.ReferenceAssemblies')) {
+            $writer.WriteStartElement('PackageReference')
+            $writer.WriteAttributeString('Include', 'Microsoft.NETFramework.ReferenceAssemblies')
+            $writer.WriteAttributeString('Version', '[1.0.3]')
+            $writer.WriteAttributeString('PrivateAssets', 'All')
+            $writer.WriteEndElement()
+        }
         foreach ($ref in $Manifest.References) {
             if ($Manifest.Sdk -eq 'Microsoft.NET.Sdk.Web' -and $ref -eq 'Microsoft.AspNetCore.App') { continue }
             $writer.WriteStartElement('FrameworkReference'); $writer.WriteAttributeString('Include', $ref); $writer.WriteEndElement()
         }
         $writer.WriteEndElement(); $writer.WriteEndElement()
     } finally { $writer.Dispose() }
-    [System.IO.File]::WriteAllText((Join-Path $Directory 'Sample.cs'), $Manifest.Source, [System.Text.UTF8Encoding]::new($false))
+    $sourceText = if ($null -ne $SourceOverride) { $SourceOverride } else { $Manifest.Source }
+    [System.IO.File]::WriteAllText((Join-Path $Directory 'Sample.cs'), $sourceText, [System.Text.UTF8Encoding]::new($false))
     return $project
 }
 
@@ -258,31 +321,34 @@ try {
         if ($PSBoundParameters.ContainsKey('Framework')) { $inputManifest.framework = $Framework }
     }
     $manifest = Get-ValidatedManifest $inputManifest
-    $releaseIndex = Get-ReleaseIndex
+    $isNetFramework = ($manifest.Framework -is [string] -and $manifest.Framework -cmatch '^net4(7[12]|8|81)$')
+    $releaseIndex = if ($isNetFramework) { $null } else { Get-ReleaseIndex }
     $manifest.Framework = Resolve-Framework $manifest.Framework $releaseIndex
     $consoleSource = $null
-    if ($manifest.Mode -eq 'console') { $consoleSource = Get-ConsoleSource $manifest }
+    if ($manifest.Mode -eq 'console') { $consoleSource = Get-ConsoleSource $manifest -StripDirectives:$isNetFramework }
     $dotnet = Get-Command dotnet -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
     if ($null -eq $dotnet) { throw 'Missing .NET SDK; install a compatible .NET 10+ SDK and the requested runtime.' }
     $sdkVersion = & $dotnet.Source --version
     if ($LASTEXITCODE -ne 0 -or $sdkVersion -notmatch '^(\d+)\.' -or [int]$Matches[1] -lt 10) { throw 'No compatible .NET 10+ SDK selected. Check installed SDKs and the current directory global.json.' }
-    $null = $manifest.Framework -match '^net(?<channel>\d+\.\d+)'
-    $targetChannel = [version]$Matches.channel
-    $targetRelease = @($releaseIndex | Where-Object { $_.product -eq '.NET' -and $_['channel-version'] -eq $targetChannel.ToString() })[0]
-    $selectedVersion = [version](($sdkVersion -split '-')[0])
-    if ($selectedVersion.Major -lt $targetChannel.Major -or ($selectedVersion.Major -eq $targetChannel.Major -and $selectedVersion.Minor -lt $targetChannel.Minor)) { throw "Selected SDK $sdkVersion cannot build $($manifest.Framework); select a compatible SDK using global.json or install one." }
-    $runtimes = @(& $dotnet.Source --list-runtimes)
-    if ($LASTEXITCODE -ne 0) { throw 'Unable to list installed .NET runtimes.' }
-    $requiredRuntimes = @('Microsoft.NETCore.App')
-    if ($manifest.Sdk -eq 'Microsoft.NET.Sdk.Web' -or 'Microsoft.AspNetCore.App' -in $manifest.References) { $requiredRuntimes += 'Microsoft.AspNetCore.App' }
-    if (@($manifest.References | Where-Object { $_ -match '^Microsoft\.WindowsDesktop\.App(?:\.|$)' }).Count) { $requiredRuntimes += 'Microsoft.WindowsDesktop.App' }
-    $prereleasePattern = if ($targetRelease['support-phase'] -in @('preview', 'go-live')) { '(?:-[^ ]+)?' } else { '' }
-    foreach ($runtime in $requiredRuntimes) {
-        if (-not @($runtimes | Where-Object { $_ -match "^$([regex]::Escape($runtime)) $([regex]::Escape($targetChannel.ToString()))\.\d+$prereleasePattern " }).Count) { throw "Missing $runtime runtime for .NET $targetChannel required by $($manifest.Framework); install the runtime before running csrun." }
+    if (-not $isNetFramework) {
+        $null = $manifest.Framework -match '^net(?<channel>\d+\.\d+)'
+        $targetChannel = [version]$Matches.channel
+        $targetRelease = @($releaseIndex | Where-Object { $_.product -eq '.NET' -and $_['channel-version'] -eq $targetChannel.ToString() })[0]
+        $selectedVersion = [version](($sdkVersion -split '-')[0])
+        if ($selectedVersion.Major -lt $targetChannel.Major -or ($selectedVersion.Major -eq $targetChannel.Major -and $selectedVersion.Minor -lt $targetChannel.Minor)) { throw "Selected SDK $sdkVersion cannot build $($manifest.Framework); select a compatible SDK using global.json or install one." }
+        $runtimes = @(& $dotnet.Source --list-runtimes)
+        if ($LASTEXITCODE -ne 0) { throw 'Unable to list installed .NET runtimes.' }
+        $requiredRuntimes = @('Microsoft.NETCore.App')
+        if ($manifest.Sdk -eq 'Microsoft.NET.Sdk.Web' -or 'Microsoft.AspNetCore.App' -in $manifest.References) { $requiredRuntimes += 'Microsoft.AspNetCore.App' }
+        if (@($manifest.References | Where-Object { $_ -match '^Microsoft\.WindowsDesktop\.App(?:\.|$)' }).Count) { $requiredRuntimes += 'Microsoft.WindowsDesktop.App' }
+        $prereleasePattern = if ($targetRelease['support-phase'] -in @('preview', 'go-live')) { '(?:-[^ ]+)?' } else { '' }
+        foreach ($runtime in $requiredRuntimes) {
+            if (-not @($runtimes | Where-Object { $_ -match "^$([regex]::Escape($runtime)) $([regex]::Escape($targetChannel.ToString()))\.\d+$prereleasePattern " }).Count) { throw "Missing $runtime runtime for .NET $targetChannel required by $($manifest.Framework); install the runtime before running csrun." }
+        }
     }
     $dependencies = @($manifest.Pins.Keys | ForEach-Object { "$_@$($manifest.Pins[$_])" })
     Write-Host "csrun: $($manifest.Mode) | $($manifest.Framework) | dependencies: $($dependencies -join ', ')"
-    if ($manifest.Mode -eq 'console') {
+    if ($manifest.Mode -eq 'console' -and -not $isNetFramework) {
         $OutputEncoding = [System.Text.UTF8Encoding]::new($false)
         if (@(Get-ChildItem -LiteralPath (Get-Location).Path -File -Filter '*.*proj').Count -gt 0) {
             # SDK 11 selects a current-directory project before considering '-'.
@@ -296,11 +362,18 @@ try {
             $consoleSource | & $dotnet.Source run - --no-launch-profile
         }
         $exitCode = $LASTEXITCODE
+    } elseif ($manifest.Mode -eq 'console') {
+        # File-based apps do not support .NET Framework TFMs directly; fall back to an isolated SDK-style project.
+        $temporaryDirectory = Join-Path ([System.IO.Path]::GetTempPath()) ('csrun-' + [guid]::NewGuid().ToString('N'))
+        $null = New-Item -ItemType Directory -Path $temporaryDirectory
+        $project = Write-Project $manifest $temporaryDirectory $true $consoleSource
+        & $dotnet.Source run --project $project --framework $manifest.Framework --no-launch-profile
+        $exitCode = $LASTEXITCODE
     } else {
         $temporaryDirectory = Join-Path ([System.IO.Path]::GetTempPath()) ('csrun-' + [guid]::NewGuid().ToString('N'))
         $null = New-Item -ItemType Directory -Path $temporaryDirectory
-        $project = Write-TestProject $manifest $temporaryDirectory
-        & $dotnet.Source run --project $project --no-launch-profile -- --show-live-output on --progress off --no-banner
+        $project = Write-Project $manifest $temporaryDirectory $isNetFramework
+        & $dotnet.Source run --project $project --framework $manifest.Framework --no-launch-profile -- --show-live-output on --progress off --no-banner
         $exitCode = $LASTEXITCODE
     }
 } catch {

@@ -1,4 +1,4 @@
-#requires -Version 7.0
+﻿#requires -Version 7.0
 [CmdletBinding()]
 param(
     [Parameter(Mandatory)][string] $Image,
@@ -198,6 +198,7 @@ Test-Case 'invalid JSON and empty stdin' {
 }
 Test-Case 'unsupported framework and conflicting pins fail' {
     Assert-Result (Invoke-Manifest (New-Manifest 'Console.WriteLine(42);' -Framework net9.0)) 1 'framework|supported'
+    Assert-Result (Invoke-Manifest (New-Manifest 'Console.WriteLine(42);' -Framework net48)) 1 'only supported natively on Windows'
     $manifest = New-Manifest 'Console.WriteLine(42);'
     $manifest.dependsOn = @('Cuemon.Kernel@11.0.0', 'Cuemon.Kernel@11.0.1')
     Assert-Result (Invoke-Manifest $manifest) 1 'conflict'
