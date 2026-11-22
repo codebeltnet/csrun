@@ -4,6 +4,21 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.0] - 2026-11-22
+
+This minor release adds Windows-only support for legacy .NET Framework target frameworks (`net471`, `net472`, `net48`, `net481`) across both `console` and `test` modes, while preserving manifest `schemaVersion` 1 and existing modern .NET execution behavior.
+
+### Added
+
+- Added Windows-only support for legacy .NET Framework TFMs (`net471`, `net472`, `net48`, `net481`) in `csrun.ps1`, bypassing the .NET Core release index, SDK channel check, and `--list-runtimes` check while still building with a selected .NET 10+ SDK and failing fast on non-Windows platforms and inside Linux containers,
+- Added an isolated temporary SDK-style `.csproj` fallback in `console` mode for `.NET Framework` targets (since `dotnet run --file` does not support `.NET Framework` TFMs directly), stripping validated matching preamble directives via `Get-ConsoleSource -StripDirectives`, configuring `LangVersion=latest` and `Microsoft.NETFramework.ReferenceAssemblies@1.0.3` (`PrivateAssets="All"` unless already pinned in `dependsOn`) for both `console` and `test` `.NET Framework` projects, and cleaning up the temporary directory in `finally`,
+- Added unit, integration, and container test coverage in `tests/csrun.Tests.ps1` and `tests/container.Tests.ps1` for `net471`–`net481` validation, rejection of unsupported TFMs (`netstandard2.0`, `net45`, `net46`, `net461`, `net462`, `net47`, `net482`, `net48-windows`), non-Windows and Linux-container rejection, `net48` console and xUnit v3 execution against `lib/netstandard2.0` package assets with exit-status and stderr preservation, and preamble directive matching/conflict handling,
+- Added documentation in `README.md` covering Windows-only `net471`–`net481` support, release-index/runtime-list bypass, non-executable TFM rejection, temporary `.csproj` fallback, and `test` mode `.NET Framework` project configuration.
+
+### Changed
+
+- Generalized `Write-TestProject` to `Write-Project` in `csrun.ps1`, adding `WarningsAsErrors=NU1603;NU1605` to generated `.csproj` files and passing `--framework` to `dotnet run --project` in `test` mode.
+
 ## [0.2.2] - 2026-11-18
 
 This patch release extends Docker publishing with release-versioned SDK aliases alongside the existing movable convenience tags. The standalone native PowerShell engine (`csrun.ps1`), manifest schema version 1 and container execution contract remain unchanged.
@@ -58,6 +73,7 @@ This is the first release that introduces csrun as a standalone PowerShell scrip
 - Added pull request and tag release workflows that run the test suite on Windows with the .NET 11 SDK and a .NET 10 compatibility job, then create a draft GitHub release with the tested `csrun.ps1` attached,
 - Added the MIT license.
 
+[0.3.0]: https://github.com/codebeltnet/csrun/compare/v0.2.2...v0.3.0
 [0.2.2]: https://github.com/codebeltnet/csrun/compare/v0.2.1...v0.2.2
 [0.2.1]: https://github.com/codebeltnet/csrun/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/codebeltnet/csrun/compare/v0.1.0...v0.2.0
