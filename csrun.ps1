@@ -178,24 +178,49 @@ function Get-ConsoleSource($Manifest, [switch] $StripDirectives) {
     foreach ($id in $Manifest.Pins.Keys) { $directives["package $id"] = $Manifest.Pins[$id] }
     # Inspect only the directive preamble, never C# declarations or method bodies.
     # Original source is appended byte-for-character, including existing directives.
+    $source = $Manifest.Source
     $inBlockComment = $false
-    $lines = $Manifest.Source -split '\r\n|\n|\r'
-    $directiveLineIndices = [System.Collections.Generic.HashSet[int]]::new()
-    for ($i = 0; $i -lt $lines.Count; $i++) {
-        $text = $lines[$i].Trim()
-        # Skip leading comments only; do not scan strings or the C# program body.
-        while ($text.Length -gt 0) {
-            if ($inBlockComment) {
-                $end = $text.IndexOf('*/', [StringComparison]::Ordinal)
-                if ($end -lt 0) { $text = ''; break }
-                $text = $text.Substring($end + 2).TrimStart(); $inBlockComment = $false
-            } elseif ($text.StartsWith('/*')) { $inBlockComment = $true; $text = $text.Substring(2) }
-            else { break }
+    $removals = [System.Collections.Generic.List[hashtable]]::new()
+    $pos = 0
+    while ($pos -lt $source.Length) {
+        $eolStart = $source.IndexOfAny([char[]]@("`r", "`n"), $pos)
+        if ($eolStart -lt 0) {
+            $lineEnd = $source.Length
+            $nextPos = $source.Length
+        } else {
+            $lineEnd = $eolStart
+            $nextPos = if ($source[$eolStart] -eq "`r" -and ($eolStart + 1) -lt $source.Length -and $source[$eolStart + 1] -eq "`n") { $eolStart + 2 } else { $eolStart + 1 }
         }
-        if ($text.Length -eq 0 -or $text.StartsWith('//')) { continue }
+        $line = $source.Substring($pos, $lineEnd - $pos)
+        $offset = 0
+        $commentEnd = 0
+        $hasPrefixComment = $false
+        # Skip leading comments only; do not scan strings or the C# program body.
+        while ($offset -lt $line.Length) {
+            if ($inBlockComment) {
+                $end = $line.IndexOf('*/', $offset, [StringComparison]::Ordinal)
+                if ($end -lt 0) { $offset = $line.Length; break }
+                $offset = $end + 2
+                $commentEnd = $offset
+                $inBlockComment = $false
+                $hasPrefixComment = $true
+            } else {
+                while ($offset -lt $line.Length -and [char]::IsWhiteSpace($line[$offset])) { $offset++ }
+                if ($offset -ge $line.Length) { break }
+                if (($offset + 1) -lt $line.Length -and $line[$offset] -eq '/' -and $line[$offset + 1] -eq '*') {
+                    $inBlockComment = $true
+                    $offset += 2
+                    $hasPrefixComment = $true
+                } else {
+                    break
+                }
+            }
+        }
+        $text = $line.Substring($offset).TrimEnd()
+        if ($text.Length -eq 0 -or $text.StartsWith('//')) { $pos = $nextPos; continue }
         # C# preprocessor directives such as #nullable do not end the SDK's
         # directive preamble. Leave them untouched, but validate following #: lines.
-        if ($text.StartsWith('#') -and -not $text.StartsWith('#:')) { continue }
+        if ($text.StartsWith('#') -and -not $text.StartsWith('#:')) { $pos = $nextPos; continue }
         if (-not $text.StartsWith('#:')) { break }
         $key = $null
         $value = $null
@@ -209,12 +234,23 @@ function Get-ConsoleSource($Manifest, [switch] $StripDirectives) {
         if ($seen.Contains($key)) { throw "Duplicate source directive '$text'; the SDK requires one occurrence per setting." }
         # A matching directive in the original source supplies this setting.
         $null = $seen.Add($key)
-        $null = $directiveLineIndices.Add($i)
+        if ($hasPrefixComment) {
+            $removals.Add(@{ Start = $pos + $commentEnd; End = $lineEnd })
+        } else {
+            $removals.Add(@{ Start = $pos; End = $nextPos })
+        }
+        $pos = $nextPos
     }
     if ($StripDirectives) {
-        if ($directiveLineIndices.Count -eq 0) { return $Manifest.Source }
-        $kept = for ($i = 0; $i -lt $lines.Count; $i++) { if (-not $directiveLineIndices.Contains($i)) { $lines[$i] } }
-        return ($kept -join "`n")
+        if ($removals.Count -eq 0) { return $source }
+        $builder = [System.Text.StringBuilder]::new($source.Length)
+        $cursor = 0
+        foreach ($span in $removals) {
+            $null = $builder.Append($source, $cursor, $span.Start - $cursor)
+            $cursor = $span.End
+        }
+        $null = $builder.Append($source, $cursor, $source.Length - $cursor)
+        return $builder.ToString()
     }
     $preamble = foreach ($key in $directives.Keys) {
         if ($seen.Contains($key)) { continue }
